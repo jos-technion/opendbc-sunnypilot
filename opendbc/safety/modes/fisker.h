@@ -67,11 +67,23 @@ static void fisker_rx_hook(const CANPacket_t *msg) {
     // its ADAS_0x313 ACC state isn't natively on this bus), and the car uses the VCU's
     // basic cruise, which is gateway-sourced and native to bus 0. Enum: 3=Active,
     // 4=Override; 9/10=Fault.
+    //
+    // NOTE: acc_main_on is intentionally NOT set from cc_state on fisker. Panda's MADS
+    // state machine treats acc_main rising as an implicit MADS engagement trigger and
+    // acc_main falling as a forced MADS disengagement. On the Ocean's 2-step ACC UX:
+    //   - RiBtnNorth press: cc_state 0->2 (Off->Standby). This is only "ready cruise",
+    //     NOT a MADS engagement moment. Firing acc_main-rising would open lat here and
+    //     block OEM's 0x1D0 => LKA fault the moment the user preps cruise.
+    //   - Brake during cruise: cc_state 3->2 (Active->Standby). Sunnypilot default
+    //     "steering_mode_on_brake = Remain Active" wants MADS to stay engaged. If
+    //     acc_main were true at cc=3 and false at cc=2, brake would falling-edge and
+    //     forcibly disengage MADS regardless of the user's steering-mode setting.
+    // Leaving acc_main_on at its default (false) sidesteps both. MADS is engaged on this
+    // port only via mads_button (RiBtnSouth on MFS_0x514 above) or via op_controls_allowed
+    // rising when cruise actually engages (pcm_cruise_check below).
     if (msg->addr == 0x358U) {
       int cc_state = msg->data[4] & 0x0FU;
       bool cruise_engaged = (cc_state == 3) || (cc_state == 4);
-      // main on ("available"): on and not off/init/fault
-      acc_main_on = (cc_state != 0) && (cc_state != 1) && (cc_state < 9);
       pcm_cruise_check(cruise_engaged);
     }
 
