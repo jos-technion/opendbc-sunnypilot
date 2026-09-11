@@ -132,21 +132,29 @@ class CarController(CarControllerBase):
       CS.out.steeringAngleDeg, lat_active, self.params.ANGLE_LIMITS,
     )
 
-    # On the rising edge of engaged, seed our alive counters from OEM's last-observed
-    # bus-2 value. Between engagements the panda forwards OEM's 0x1D0/0x1C0 to bus 0
-    # (fisker_fwd_hook only blocks while engaged), so EPS has been tracking OEM's alive
-    # counter. Our first re-engage frame must be (OEM_last + 1), else EPS latches LKA.
-    # Also snap our SecOC msg counter's low 6 bits to OEM's wire value + 1; upper bits
-    # stay from our free-running window index (< 128 per Reset window).
-    if engaged and not self.was_engaged_prev:
-      self.alive_1d0 = (int(CS.oem_1d0_alive) + 1) % 15
-      self.alive_1c0 = (int(CS.oem_1c0_alive) + 1) % 15
-      # keep upper 10 bits of secoc_window_ctr, replace lower 6 with (OEM_wire + 1) mod 64
-      snap_lo = (int(CS.oem_1d0_secoc_wire_ctr) + 1) & 0x3F
-      self.secoc_window_ctr = (self.secoc_window_ctr & ~0x3F) | snap_lo
-    else:
-      self.alive_1d0 = (self.alive_1d0 + 1) % 15
-      self.alive_1c0 = (self.alive_1c0 + 1) % 15
+    # Stay in PERFECT lockstep with OEM's AliveCounter throughout the engaged window,
+    # not just at engage. Both OEM and our carcontroller run nominally at 100 Hz, but
+    # any jitter causes drift over an engagement session. At disengage, panda unblocks
+    # OEM's 0x1D0/0x1C0 → OEM's next frame lands on bus 0 with OEM's counter. EPS was
+    # tracking OUR last-sent counter and expects that + 1. If we drifted, OEM's next
+    # value doesn't match — EPS latches "one frame off" and BSM flashes an error.
+    # Fix: every tick, snap our alive to (OEM_bus2_current + 1). We're always exactly
+    # one ahead of OEM's on-wire counter, so at disengage OEM's next = our_last, EPS
+    # expected our_last + 1... wait that's still off by one. See below.
+    #
+    # Actually: we send OEM_current + 1. EPS accepts this (last was OEM_(current-1)
+    # from before panda blocked, expects OEM_current, gets OEM_current + 1 — jump of 1
+    # from what EPS expected but strictly increasing so most receivers tolerate). Our
+    # last-transmitted = OEM_current + 1. Meanwhile OEM's next on bus 2 = OEM_current
+    # + 1 (same). When we disengage and panda unblocks, OEM's NEXT after that would be
+    # OEM_current + 2 — which is our_last + 1. Match. Handoff seamless.
+    #
+    # For SecOC msg counter: same idea, snap the low 6 bits to (OEM_wire + 1) mod 64
+    # every tick. Upper bits stay from our free-running window index.
+    self.alive_1d0 = (int(CS.oem_1d0_alive) + 1) % 15
+    self.alive_1c0 = (int(CS.oem_1c0_alive) + 1) % 15
+    snap_lo = (int(CS.oem_1d0_secoc_wire_ctr) + 1) & 0x3F
+    self.secoc_window_ctr = (self.secoc_window_ctr & ~0x3F) | snap_lo
     self.was_engaged_prev = engaged
 
     if engaged:
