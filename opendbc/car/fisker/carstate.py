@@ -55,6 +55,17 @@ class CarState(CarStateBase):
     self.secoc_sync_mac = b"\x00\x00\x00"
     self.secoc_sync_seen = False
 
+    # OEM ADAS's own counters on 0x1D0 / 0x1C0, snapshotted from bus 2 (cam-side of the
+    # camera splice). The EPS validates our re-engage frames against its "last accepted
+    # counter + 1" rule — if we transmit a value that isn't OEM_last + 1, EPS rejects and
+    # latches an LKA fault. Feeding OEM's latest AliveCounter into our carcontroller lets
+    # us seed our tx counter to (OEM + 1) at every engagement transition so hand-offs are
+    # seamless (see fisker/carcontroller.py). SecOC wire byte is only 6 bits of the full
+    # msg_counter; enough to align lower bits at engage.
+    self.oem_1d0_alive = 0
+    self.oem_1c0_alive = 0
+    self.oem_1d0_secoc_wire_ctr = 0    # (byte >> 2) & 0x3F — lower 6 bits of msg_counter
+
     # Button state edge detection
     self._prev_button_state = {sig: 0 for sig in BUTTON_SIGNAL_TO_TYPE}
 
@@ -183,6 +194,18 @@ class CarState(CarStateBase):
     # ---- Faults ----
     ret.accFaulted = cc_state in (9, 10) or bool(cp_pt.vl["ESP_0x114"]["ESP_FltIndcn_AEB"])
 
+    # ---- OEM ADAS lateral counters (bus 2, for takeover alignment) --------
+    # Snapshot the OEM ADAS's own AliveCounter and SSecOC_Fresh_Byte0 from bus 2. The
+    # EPS validates our re-engage frames against its last-accepted counter+1 rule — if
+    # we transmit anything else, EPS latches an LKA fault (surfaces as "ADAS error" on
+    # cluster and cruise fault in openpilot). Carcontroller reads these values and seeds
+    # our tx counters at every engagement transition so hand-off is seamless.
+    oem_1d0 = cp_cam.vl["ADAS_0x1D0"]
+    oem_1c0 = cp_cam.vl["ADAS_0x1C0"]
+    self.oem_1d0_alive = int(oem_1d0["ADAS_1D0_AliveCounter"])
+    self.oem_1c0_alive = int(oem_1c0["ADAS_1C0_AliveCounter"])
+    self.oem_1d0_secoc_wire_ctr = (int(oem_1d0["ADAS_1D0_SSecOC_Fresh_Byte0"]) >> 2) & 0x3F
+
     # ---- SecOC sync (GW_Syn_All 0x20) ----
     # Trip counter = 2 bytes BE, Reset counter = 3 bytes BE, MAC = 3 bytes.
     sync = cp_pt.vl["GW_Syn_All"]
@@ -235,6 +258,12 @@ class CarState(CarStateBase):
     cam_msgs = [
       ("ADAS_0x314", 50),   # BSDSts + LKA/ELKA state enums
       ("ADAS_0x315", 20),   # BSD_CID_{Le,Ri}DispReq — blind-spot alert
+      # OEM ADAS's lateral commands on bus 2 — we snapshot the AliveCounters and SecOC
+      # wire freshness byte so carcontroller can align its transmitted counters to what
+      # the EPS was tracking BEFORE the panda takeover blocked OEM's stream. Rejection on
+      # the very first re-engage frame is what surfaces as "ADAS error" on the cluster.
+      ("ADAS_0x1C0", 100),  # ADAS_1C0_AliveCounter
+      ("ADAS_0x1D0", 100),  # ADAS_1D0_AliveCounter + ADAS_1D0_SSecOC_Fresh_Byte0
     ]
     return {
       Bus.pt: CANParser(DBC[CP.carFingerprint][Bus.pt], pt_msgs, CANBUS.pt),

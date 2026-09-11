@@ -49,6 +49,16 @@ class CarController(CarControllerBase):
     # emergency brake unavailable" on the cluster and a cruise fault in openpilot.
     self.long_ever_active = False
 
+    # Per-message AliveCounter (E2E) tracked separately from self.frame so we can seed
+    # each engagement transition from OEM's last-observed value on bus 2 and stay in
+    # lockstep. Without this, on 2nd/3rd re-engage the EPS rejects our first frame as
+    # out-of-sequence (jumped from OEM's last-seen to our free-running self.frame%15) and
+    # latches into LKA fault ("ADAS error" on cluster). See tizi's parked LKA-unavailable
+    # issue for the same phenomenon on longitudinal.
+    self.alive_1d0 = 0
+    self.alive_1c0 = 0
+    self.was_engaged_prev = False
+
   def _maybe_verify_key(self, CS) -> None:
     """Verify the stored SecOC key against the GW sync MAC once at startup."""
     if self.secoc_key_verified or not CS.secoc_sync_seen or not self.secoc_key:
@@ -84,8 +94,16 @@ class CarController(CarControllerBase):
       self.secoc_prev_reset = reset
     self.secoc_window_ctr += 1
 
-    # E2E AliveCounter (byte1 low nibble): free 0..14 counter, +1 per frame, never 15
-    # (15 is the E2E invalid sentinel — DBC range [0|14]).
+    # E2E AliveCounter (byte1 low nibble): 0..14 counter, +1 per frame, never 15 (15 is
+    # the E2E invalid sentinel — DBC range [0|14]). For LATERAL (0x1D0/0x1C0) we track
+    # per-PDU below so we can align to OEM's most recent bus-2 value at every engage
+    # transition — that way our first re-engage frame is (OEM_last + 1), exactly what EPS
+    # expects. If we free-ran with self.frame%15 through disengaged periods, EPS's
+    # last-accepted-from-OEM would diverge from our next-transmit and the first re-engage
+    # frame would be rejected (surfaces as an LKA fault / "ADAS error" on cluster and
+    # MADS auto-off). The longitudinal path (0x121/0x117/0x118, alpha_long only) still
+    # uses the free-running counter for now — same alignment could help there too but is
+    # scoped separately.
     alive = self.frame % 15
 
     # ---- Lateral (steering angle 0x1D0 + activation 0x1C0 @ 100 Hz) ----
@@ -113,10 +131,28 @@ class CarController(CarControllerBase):
       actuators.steeringAngleDeg, self.apply_angle_last, CS.out.vEgoRaw,
       CS.out.steeringAngleDeg, lat_active, self.params.ANGLE_LIMITS,
     )
+
+    # On the rising edge of engaged, seed our alive counters from OEM's last-observed
+    # bus-2 value. Between engagements the panda forwards OEM's 0x1D0/0x1C0 to bus 0
+    # (fisker_fwd_hook only blocks while engaged), so EPS has been tracking OEM's alive
+    # counter. Our first re-engage frame must be (OEM_last + 1), else EPS latches LKA.
+    # Also snap our SecOC msg counter's low 6 bits to OEM's wire value + 1; upper bits
+    # stay from our free-running window index (< 128 per Reset window).
+    if engaged and not self.was_engaged_prev:
+      self.alive_1d0 = (int(CS.oem_1d0_alive) + 1) % 15
+      self.alive_1c0 = (int(CS.oem_1c0_alive) + 1) % 15
+      # keep upper 10 bits of secoc_window_ctr, replace lower 6 with (OEM_wire + 1) mod 64
+      snap_lo = (int(CS.oem_1d0_secoc_wire_ctr) + 1) & 0x3F
+      self.secoc_window_ctr = (self.secoc_window_ctr & ~0x3F) | snap_lo
+    else:
+      self.alive_1d0 = (self.alive_1d0 + 1) % 15
+      self.alive_1c0 = (self.alive_1c0 + 1) % 15
+    self.was_engaged_prev = engaged
+
     if engaged:
-      steer_msg = self.fcan.create_steering_control(self.apply_angle_last, alive)
+      steer_msg = self.fcan.create_steering_control(self.apply_angle_last, self.alive_1d0)
       can_sends.append(self._stamp(steer_msg, STEER_CAN_ID, trip, reset, self.secoc_window_ctr))
-      can_sends.append(self.fcan.create_lat_control(lat_active, alive, driver_override=False))
+      can_sends.append(self.fcan.create_lat_control(lat_active, self.alive_1c0, driver_override=False))
 
     # ---- Longitudinal (accel 0x121 + status 0x117/0x118 @ 100 Hz) ----
     # Same architecture as lateral (see comment above): send the whole triple across the
