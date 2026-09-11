@@ -186,6 +186,11 @@ static safety_config fisker_init(uint16_t param) {
     {.msg = {{0x1C2, 0, 8,  50U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},  // steering angle
     {.msg = {{0x1C4, 0, 8,  50U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},  // driver torque
     {.msg = {{0x358, 0, 8,  10U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},  // VCU cruise-control state
+    // MFS_0x514 (MFSS buttons) whitelisted so our fisker_rx_hook actually runs on it —
+    // the safety framework gates rx_hook execution on rx_checks membership. Without this,
+    // our MFS_RiBtnSouth read in the rx hook was dead code and mads_button_press never
+    // toggled, so panda's controls_allowed_lateral never opened on MADS press.
+    {.msg = {{0x514, 0, 8,  20U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},  // MFSS buttons (MADS trigger)
   };
 
   // Fisker on-vehicle bring-up: honor the LONG_CONTROL bit on release too. Stock openpilot
