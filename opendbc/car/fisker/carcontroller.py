@@ -49,14 +49,18 @@ class CarController(CarControllerBase):
     # emergency brake unavailable" on the cluster and a cruise fault in openpilot.
     self.long_ever_active = False
 
-    # Per-message AliveCounter (E2E) tracked separately from self.frame so we can seed
-    # each engagement transition from OEM's last-observed value on bus 2 and stay in
-    # lockstep. Without this, on 2nd/3rd re-engage the EPS rejects our first frame as
-    # out-of-sequence (jumped from OEM's last-seen to our free-running self.frame%15) and
-    # latches into LKA fault ("ADAS error" on cluster). See tizi's parked LKA-unavailable
-    # issue for the same phenomenon on longitudinal.
+    # "We ARE OEM" AliveCounter substitution: every OEM 0x1D0/0x1C0 tick that panda
+    # blocks, we transmit a frame with the SAME AliveCounter that OEM would have sent —
+    # our stream literally continues OEM's numbering during the blocked window. At
+    # disengage panda unblocks OEM, and OEM's next tick lands at our_last + 1 which is
+    # exactly what EPS was expecting next — seamless handoff both directions, no
+    # momentary BSM error on disengage (see user's diagram). Only transmit when OEM's
+    # bus-2 counter has advanced since our previous send, else we'd emit a duplicate
+    # (EPS rejects duplicates in the E2E monotonic check).
     self.alive_1d0 = 0
     self.alive_1c0 = 0
+    self.last_sent_alive_1d0 = -1   # invalid sentinel — force initialization at engage
+    self.last_sent_alive_1c0 = -1
     self.was_engaged_prev = False
 
   def _maybe_verify_key(self, CS) -> None:
@@ -132,34 +136,49 @@ class CarController(CarControllerBase):
       CS.out.steeringAngleDeg, lat_active, self.params.ANGLE_LIMITS,
     )
 
-    # Stay in PERFECT lockstep with OEM's AliveCounter throughout the engaged window,
-    # not just at engage. Both OEM and our carcontroller run nominally at 100 Hz, but
-    # any jitter causes drift over an engagement session. At disengage, panda unblocks
-    # OEM's 0x1D0/0x1C0 → OEM's next frame lands on bus 0 with OEM's counter. EPS was
-    # tracking OUR last-sent counter and expects that + 1. If we drifted, OEM's next
-    # value doesn't match — EPS latches "one frame off" and BSM flashes an error.
-    # Fix: every tick, snap our alive to (OEM_bus2_current + 1). We're always exactly
-    # one ahead of OEM's on-wire counter, so at disengage OEM's next = our_last, EPS
-    # expected our_last + 1... wait that's still off by one. See below.
+    # "We ARE OEM" — substitute OEM's blocked frames verbatim.
     #
-    # Actually: we send OEM_current + 1. EPS accepts this (last was OEM_(current-1)
-    # from before panda blocked, expects OEM_current, gets OEM_current + 1 — jump of 1
-    # from what EPS expected but strictly increasing so most receivers tolerate). Our
-    # last-transmitted = OEM_current + 1. Meanwhile OEM's next on bus 2 = OEM_current
-    # + 1 (same). When we disengage and panda unblocks, OEM's NEXT after that would be
-    # OEM_current + 2 — which is our_last + 1. Match. Handoff seamless.
+    # Illustrating with alive counter (0x1D0 example):
+    #   OEM on bus 2 (all ticks, whether blocked or forwarded):  1  2  3  4  5  6  7  8  9  10 11 12
+    #   Panda forwards to bus 0 (EPS sees):                      1  2  3  4                    11 12
+    #                                                            └── ENGAGE ──┘     └─ DISENGAGE
+    #   Our TX on bus 0 replaces OEM's blocked window:                    5  6  7  8  9  10
     #
-    # For SecOC msg counter: same idea, snap the low 6 bits to (OEM_wire + 1) mod 64
-    # every tick. Upper bits stay from our free-running window index.
-    self.alive_1d0 = (int(CS.oem_1d0_alive) + 1) % 15
-    self.alive_1c0 = (int(CS.oem_1c0_alive) + 1) % 15
-    snap_lo = (int(CS.oem_1d0_secoc_wire_ctr) + 1) & 0x3F
-    self.secoc_window_ctr = (self.secoc_window_ctr & ~0x3F) | snap_lo
+    # We send the SAME AliveCounter OEM would have sent (not +1). Panda blocks OEM's
+    # bus-2 → bus-0 forwarding for those exact ticks, so EPS sees "1 2 3 4" (from OEM),
+    # then "5 6 7 8 9 10" (from us — same values OEM would have sent), then "11 12"
+    # (from OEM again). Perfectly continuous — no gap at engage, no duplicate/gap at
+    # disengage. Only send when OEM's bus-2 counter has advanced since our previous
+    # send (otherwise we'd repeat and EPS rejects duplicates).
+    oem_1d0_now = int(CS.oem_1d0_alive)
+    oem_1c0_now = int(CS.oem_1c0_alive)
+    oem_secoc_wire_now = int(CS.oem_1d0_secoc_wire_ctr)
+
+    if engaged and not self.was_engaged_prev:
+      # First engage tick: seed last_sent to OEM's current value so we DON'T substitute
+      # for the frame OEM already sent to EPS (that would be a duplicate). We wait for
+      # OEM's NEXT tick (blocked from bus 0) and substitute for that one.
+      self.last_sent_alive_1d0 = oem_1d0_now
+      self.last_sent_alive_1c0 = oem_1c0_now
     self.was_engaged_prev = engaged
 
-    if engaged:
+    should_send_1d0 = engaged and (oem_1d0_now != self.last_sent_alive_1d0)
+    should_send_1c0 = engaged and (oem_1c0_now != self.last_sent_alive_1c0)
+    if should_send_1d0:
+      self.alive_1d0 = oem_1d0_now
+      self.last_sent_alive_1d0 = oem_1d0_now
+      # Snap SecOC msg counter's low 6 bits to OEM's wire value (same tick, no offset).
+      # Upper bits stay from free-running window index — matches OEM's actual full
+      # counter as long as we haven't drifted across a wrap boundary.
+      self.secoc_window_ctr = (self.secoc_window_ctr & ~0x3F) | (oem_secoc_wire_now & 0x3F)
+    if should_send_1c0:
+      self.alive_1c0 = oem_1c0_now
+      self.last_sent_alive_1c0 = oem_1c0_now
+
+    if should_send_1d0:
       steer_msg = self.fcan.create_steering_control(self.apply_angle_last, self.alive_1d0)
       can_sends.append(self._stamp(steer_msg, STEER_CAN_ID, trip, reset, self.secoc_window_ctr))
+    if should_send_1c0:
       can_sends.append(self.fcan.create_lat_control(lat_active, self.alive_1c0, driver_override=False))
 
     # ---- Longitudinal (accel 0x121 + status 0x117/0x118 @ 100 Hz) ----
