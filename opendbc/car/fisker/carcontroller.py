@@ -136,49 +136,49 @@ class CarController(CarControllerBase):
       CS.out.steeringAngleDeg, lat_active, self.params.ANGLE_LIMITS,
     )
 
-    # "We ARE OEM" — substitute OEM's blocked frames verbatim.
+    # "We ARE OEM" AliveCounter substitution — seed once from OEM at engage, then
+    # increment 1 per tick to stay in perfect lockstep with OEM (both at 100 Hz).
     #
-    # Illustrating with alive counter (0x1D0 example):
-    #   OEM on bus 2 (all ticks, whether blocked or forwarded):  1  2  3  4  5  6  7  8  9  10 11 12
-    #   Panda forwards to bus 0 (EPS sees):                      1  2  3  4                    11 12
-    #                                                            └── ENGAGE ──┘     └─ DISENGAGE
-    #   Our TX on bus 0 replaces OEM's blocked window:                    5  6  7  8  9  10
+    # Illustrating (0x1D0 example):
+    #   OEM on bus 2 (all ticks):        1  2  3  4  5  6  7  8  9  10 11 12
+    #   Panda forwards to bus 0:         1  2  3  4                    11 12
+    #                                    └── ENGAGE ──┘     └─ DISENGAGE
+    #   Our TX (self-incrementing):               5  6  7  8  9  10
     #
-    # We send the SAME AliveCounter OEM would have sent (not +1). Panda blocks OEM's
-    # bus-2 → bus-0 forwarding for those exact ticks, so EPS sees "1 2 3 4" (from OEM),
-    # then "5 6 7 8 9 10" (from us — same values OEM would have sent), then "11 12"
-    # (from OEM again). Perfectly continuous — no gap at engage, no duplicate/gap at
-    # disengage. Only send when OEM's bus-2 counter has advanced since our previous
-    # send (otherwise we'd repeat and EPS rejects duplicates).
-    oem_1d0_now = int(CS.oem_1d0_alive)
-    oem_1c0_now = int(CS.oem_1c0_alive)
-    oem_secoc_wire_now = int(CS.oem_1d0_secoc_wire_ctr)
-
+    # Previous version used `alive = OEM_bus2_current` per-tick. Problem: if OEM ticked
+    # twice between our two carcontroller reads (tick jitter), we'd read a value that
+    # skipped one from our last-sent — creating a +2 jump on the wire that the E2E
+    # validator rejects. After a few of these, LKA faults mid-engagement.
+    #
+    # Seed-and-increment eliminates that: our counter marches at exactly our tick rate
+    # (which is nominally the same as OEM's), so we produce every value once, in order,
+    # regardless of when OEM's frames land in carstate.
+    #
+    # SecOC msg counter uses the same seed-and-increment idea — the per-Reset-window
+    # free-running counter (self.secoc_window_ctr) already increments +1 per tick and
+    # resets on GW Reset boundary. At engage rising edge we snap it to OEM's observed
+    # counter so we start matching OEM's actual counter value, then let the free-running
+    # increment carry it forward.
     if engaged and not self.was_engaged_prev:
-      # First engage tick: seed last_sent to OEM's current value so we DON'T substitute
-      # for the frame OEM already sent to EPS (that would be a duplicate). We wait for
-      # OEM's NEXT tick (blocked from bus 0) and substitute for that one.
-      self.last_sent_alive_1d0 = oem_1d0_now
-      self.last_sent_alive_1c0 = oem_1c0_now
+      # Seed from OEM's most recent bus-2 values so our stream picks up where OEM's
+      # blocked stream leaves off. Increment before first TX so first frame equals
+      # (OEM_current + 1) which is OEM's next-would-be value — EPS's expected next.
+      self.alive_1d0 = int(CS.oem_1d0_alive)
+      self.alive_1c0 = int(CS.oem_1c0_alive)
+      # Snap SecOC low 6 bits to OEM's wire counter. Upper bits stay from free-running
+      # window index — matches OEM's actual full counter within one Reset window.
+      self.secoc_window_ctr = (self.secoc_window_ctr & ~0x3F) | (int(CS.oem_1d0_secoc_wire_ctr) & 0x3F)
     self.was_engaged_prev = engaged
 
-    should_send_1d0 = engaged and (oem_1d0_now != self.last_sent_alive_1d0)
-    should_send_1c0 = engaged and (oem_1c0_now != self.last_sent_alive_1c0)
-    if should_send_1d0:
-      self.alive_1d0 = oem_1d0_now
-      self.last_sent_alive_1d0 = oem_1d0_now
-      # Snap SecOC msg counter's low 6 bits to OEM's wire value (same tick, no offset).
-      # Upper bits stay from free-running window index — matches OEM's actual full
-      # counter as long as we haven't drifted across a wrap boundary.
-      self.secoc_window_ctr = (self.secoc_window_ctr & ~0x3F) | (oem_secoc_wire_now & 0x3F)
-    if should_send_1c0:
-      self.alive_1c0 = oem_1c0_now
-      self.last_sent_alive_1c0 = oem_1c0_now
-
-    if should_send_1d0:
+    if engaged:
+      # Increment ONCE per tick, before TX. First frame after engage = (seed + 1) which
+      # equals OEM's next-would-be counter value — matches EPS's expected next.
+      self.alive_1d0 = (self.alive_1d0 + 1) % 15
+      self.alive_1c0 = (self.alive_1c0 + 1) % 15
+      # secoc_window_ctr already got incremented earlier in this update via the
+      # free-running counter block, so it doesn't need to be incremented again here.
       steer_msg = self.fcan.create_steering_control(self.apply_angle_last, self.alive_1d0)
       can_sends.append(self._stamp(steer_msg, STEER_CAN_ID, trip, reset, self.secoc_window_ctr))
-    if should_send_1c0:
       can_sends.append(self.fcan.create_lat_control(lat_active, self.alive_1c0, driver_override=False))
 
     # ---- Longitudinal (accel 0x121 + status 0x117/0x118 @ 100 Hz) ----
