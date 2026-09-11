@@ -276,6 +276,7 @@ class TestFwFingerprintTiming(unittest.TestCase):
       'gm': 1.0,
       'body': 0.1,
       'chrysler': 0.3,
+      'fisker': 0.02,  # empty FW_QUERY_CONFIG.requests => ~0 query time (tol=0.05)
       'ford': 1.5,
       'honda': 0.45,
       'hyundai': 0.65,

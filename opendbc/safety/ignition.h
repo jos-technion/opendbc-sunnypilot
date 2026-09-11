@@ -66,6 +66,16 @@ void ignition_can_hook(const CANPacket_t *msg) {
       }
       prev_counter_vw_meb = counter;
     }
+
+    // Fisker Ocean exception (custom Fisker firmware only)
+    // No switched-12V ignition line on the harness — derive ignition from the BCM power
+    // mode. BCM_0x333.BCM_PwrMod (21|3 -> data[2] bits 5..3) == 4 (Run) means the car is
+    // on. 0x333 is a steady 20 Hz, so ignition_can_cnt resets well inside the main.c
+    // watchdog and ignition tracks the BCM directly (no flicker once the rate is right).
+    if ((msg->addr == 0x333U) && (len == 8)) {
+      ignition_can = ((msg->data[2] >> 3) & 0x07U) == 4U;  // BCM_PwrMod: 4 = Run
+      ignition_can_cnt = 0U;
+    }
   }
 
   // TODO: this is too loose, Teslas have 0x222

@@ -652,6 +652,7 @@ struct CarParams {
     volvo @36;
     bmw @37;
     mg @38;
+    fisker @39;
   }
 
   enum SteerControlType {

@@ -35,6 +35,7 @@
 #define SAFETY_RIVIAN 33U
 #define SAFETY_VOLKSWAGEN_MEB 34U
 #define SAFETY_MG 38U
+#define SAFETY_FISKER 39U
 
 #define GET_BIT(msg, b) ((bool)!!(((msg)->data[((b) / 8U)] >> ((b) % 8U)) & 0x1U))
 #define GET_FLAG(value, mask) (((value) & (mask)) == (mask))
@@ -349,6 +350,7 @@ extern const safety_hooks chrysler_cusw_hooks;
 extern const safety_hooks elm327_hooks;
 extern const safety_hooks nooutput_hooks;
 extern const safety_hooks alloutput_hooks;
+extern const safety_hooks fisker_hooks;
 extern const safety_hooks ford_hooks;
 extern const safety_hooks gm_hooks;
 extern const safety_hooks honda_nidec_hooks;
