@@ -89,9 +89,13 @@ class CarController(CarControllerBase):
     alive = self.frame % 15
 
     # ---- Lateral (steering angle 0x1D0 + activation 0x1C0 @ 100 Hz) ----
-    # Send for the WHOLE engaged window (cruiseState.enabled matches the panda's
-    # controls_allowed / 0x1C0 forwarding-block window) so the cluster/EPS never see the
-    # frame disappear.
+    # Send for the WHOLE engaged window so the cluster/EPS never see the frame disappear.
+    # Engagement can come from EITHER regular cruise (cruiseState.enabled) OR sunnypilot
+    # MADS (CC_SP.mads.enabled). The panda's fisker_fwd_hook mirrors this: it blocks the
+    # OEM's 0x1D0/0x1C0 on bus 2 whenever (controls_allowed || controls_allowed_lateral),
+    # which is the exact same window. If openpilot stops transmitting during that window
+    # (e.g. MADS engaged without cruise), the EPS receives NEITHER openpilot's frames
+    # nor the OEM's (panda blocks the OEM's) → LKA fault + wheel doesn't move.
     #
     # DISABLED: driver-torque override (release EPS on steeringPressed). The Ocean's
     # EPS_DrvrSteerTq reads torque on the whole steering column — including reaction
@@ -103,7 +107,8 @@ class CarController(CarControllerBase):
     # behaviour handle overrides. `driver_override` on 0x1C0 is Gateway-only (EPS doesn't
     # read it) so we send False to keep the wire quiet.
     lat_active = CC.latActive and secoc_ok
-    engaged = CS.out.cruiseState.enabled and secoc_ok
+    mads_engaged = bool(CC_SP.mads.enabled) if CC_SP is not None else False
+    engaged = (CS.out.cruiseState.enabled or mads_engaged) and secoc_ok
     self.apply_angle_last = apply_std_steer_angle_limits(
       actuators.steeringAngleDeg, self.apply_angle_last, CS.out.vEgoRaw,
       CS.out.steeringAngleDeg, lat_active, self.params.ANGLE_LIMITS,
