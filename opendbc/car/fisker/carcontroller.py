@@ -63,6 +63,12 @@ class CarController(CarControllerBase):
     self.last_sent_alive_1c0 = -1
     self.was_engaged_prev = False
 
+    # ICC 0x52A spoof: emit ONE frame per OEM tick (detected by AliveCounter change).
+    # ICC broadcasts at ~10 Hz while we control at 100 Hz, so a naive tx-every-tick
+    # would emit ~10 duplicates per OEM tick — the receiver's E2E monotonic-counter
+    # validator would flag those as replays and reject them.
+    self.last_spoofed_icc_alive = -1
+
   def _maybe_verify_key(self, CS) -> None:
     """Verify the stored SecOC key against the GW sync MAC once at startup."""
     if self.secoc_key_verified or not CS.secoc_sync_seen or not self.secoc_key:
@@ -245,6 +251,28 @@ class CarController(CarControllerBase):
                                                        gear_req=0, counter=alive))
         can_sends.append(self.fcan.create_long_esp_handshake(long_active, gas_override,
                                                               counter=alive))
+
+    # ---- ICC 0x52A spoof (bus 2) ----
+    # While cruise is engaged, replace the OEM ICC settings frame flowing bus 0 -> bus 2
+    # with a mutated copy that pins ICCACCFuncTyp to 2 — everything else (all other
+    # ICC settings + AliveCounter + reserved bits) is forwarded byte-identically, and
+    # the CheckSum is patched via XOR delta (no need to know 0x52A's DataID).
+    #
+    # Panda's fisker_fwd_hook blocks the OEM's bus-0 -> bus-2 forwarding of 0x52A over
+    # the same engaged window, so the receiver (ADAS + FCM on bus 2) sees exactly one
+    # 0x52A per OEM tick: ours. Cadence: emit once per OEM tick (detected by
+    # AliveCounter change) so we never send duplicates that would trip the receiver's
+    # E2E monotonic-counter check. Gate is CS.out.cruiseState.enabled — MADS-alone is
+    # NOT included (the whole point of this spoof is to flip the ACC func type; there
+    # is no ACC state to flip while MADS is engaged without cruise).
+    icc_active = CS.out.cruiseState.enabled and CS.icc_52a_seen
+    if icc_active and CS.icc_52a_alive != self.last_spoofed_icc_alive:
+      can_sends.append(self.fcan.create_icc_spoof_0x52a(CS.icc_52a_values))
+      self.last_spoofed_icc_alive = CS.icc_52a_alive
+    if not icc_active:
+      # Reset so the next engagement's first tick emits immediately rather than
+      # waiting for an OEM AliveCounter tick to happen to differ from a stale value.
+      self.last_spoofed_icc_alive = -1
 
     # ---- HUD ----
     # Forwarding intercept: the OEM ADAS module stays alive on bus 2 and the panda

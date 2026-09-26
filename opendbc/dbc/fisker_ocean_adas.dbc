@@ -474,6 +474,38 @@ BO_ 1300 MFS_0x514: 8 GW
  SG_ MFS_Ri_Fail : 49|2@0+ (1,0) [0|3] ""  ADAS
  SG_ MFS_Le_Fail : 51|2@0+ (1,0) [0|3] ""  ADASBUS_Virtual_ECU
 
+BO_ 1322 ICC_0x52A: 8 ICC
+ SG_ ICC_0x52ACheckSum : 7|8@0+ (1,0) [0|255] ""  ADAS,FCM
+ SG_ ICC_0x52AAliveCounter : 11|4@0+ (1,0) [0|14] ""  ADAS,FCM
+ SG_ ICC_FACMDynmcSenstvty : 12|1@0+ (1,0) [0|1] ""  ADAS
+ SG_ ICCUsrProfTiGapSet : 15|3@0+ (1,0) [0|7] ""  ADAS
+ SG_ ICC_LKASetting : 17|2@0+ (1,0) [0|3] ""  ADAS
+ SG_ ICC_FACMSetting : 19|2@0+ (1,0) [0|3] ""  ADAS
+ SG_ ICC_AEBSensitivity : 21|2@0+ (1,0) [0|3] ""  ADAS,FCM
+ SG_ ICC_BACMSetting : 23|2@0+ (1,0) [0|3] ""  ADAS
+ SG_ ICC_BACMSensitivity : 25|2@0+ (1,0) [0|3] ""  ADAS
+ SG_ ICC_AEBJerkSetReq : 27|2@0+ (1,0) [0|3] ""  ADAS
+ SG_ ICCActvStyGlblSetting : 28|1@0+ (1,0) [0|1] ""  ADAS
+ SG_ ICC_TSRSetting : 29|1@0+ (1,0) [0|1] ""  ADAS
+ SG_ ICC_ESASetting : 30|1@0+ (1,0) [0|1] ""  ADAS
+ SG_ ICCELKASteeringInterventionSet : 31|1@0+ (1,0) [0|1] ""  ADAS
+ SG_ ICCLaneTrajectorySetting : 32|1@0+ (1,0) [0|1] ""  ADAS
+ SG_ ICCACCSwt : 34|2@0+ (1,0) [0|3] ""  ADAS
+ SG_ ICCACCAutoSpdSts : 35|1@0+ (1,0) [0|1] ""  ADAS
+ SG_ ICCACCSpdStepSize : 36|1@0+ (1,0) [0|1] ""  ADAS
+ SG_ ICCACCFuncTyp : 39|3@0+ (1,0) [0|7] ""  ADAS
+ SG_ ICCACCSpdLimOffs : 45|6@0+ (0.5,0) [0|31.5] ""  ADAS
+ SG_ ICCACCSpdLimOffsTyp : 47|2@0+ (1,0) [0|3] ""  ADAS
+ SG_ ICCACCTerrainSetting : 48|1@0+ (1,0) [0|1] ""  ADAS
+ SG_ ICC_0x52A_Rsv49 : 49|1@0+ (1,0) [0|1] ""  ADAS
+ SG_ ICCACCTiGapCfm : 51|2@0+ (1,0) [0|3] ""  ADAS
+ SG_ ICCISASetting : 54|3@0+ (1,0) [0|7] ""  ADAS
+ SG_ ICC_0x52A_Rsv55 : 55|1@0+ (1,0) [0|1] ""  ADAS
+ SG_ ICC_FCTASensitivity : 57|2@0+ (1,0) [0|3] ""  ADAS
+ SG_ ICCISAWarnStopReq : 58|1@0+ (1,0) [0|1] ""  ADAS
+ SG_ ICC_TLRSetting : 61|3@0+ (1,0) [0|7] ""  ADAS
+ SG_ ICC_FCTA_Setting : 63|2@0+ (1,0) [0|3] ""  ADAS
+
 BO_ 1329 ICC_0x531: 8 GW
  SG_ ICC_TotMilgVld_ODO : 0|1@0+ (1,0) [0|1] ""  ADAS,FCM,PKC
  SG_ ICC_TotMilg_ODO : 11|28@0+ (0.01,0) [0|2000000] "km"  ADAS,FCM,PKC

@@ -183,6 +183,9 @@ static safety_config fisker_init(uint16_t param) {
   static const CanMsg FISKER_TX_MSGS[] = {
     {0x1D0, 0, 8, .check_relay = true, .disable_static_blocking = true},    // steering angle
     {0x1C0, 0, 8, .check_relay = true, .disable_static_blocking = true},    // lateral activation
+    // ICC 0x52A spoof: openpilot repacks OEM's ICC settings frame with ICCACCFuncTyp=2
+    // and sends it on bus 2. See create_icc_spoof_0x52a + fwd_hook below.
+    {0x52A, 2, 8, .check_relay = true, .disable_static_blocking = true},    // ICC spoof (bus 2)
   };
   static const CanMsg FISKER_LONG_TX_MSGS[] = {
     {0x1D0, 0, 8, .check_relay = true, .disable_static_blocking = true},    // steering angle
@@ -190,6 +193,7 @@ static safety_config fisker_init(uint16_t param) {
     {0x121, 0, 8, .check_relay = true, .disable_static_blocking = true},    // accel (op long only)
     {0x117, 0, 8, .check_relay = true, .disable_static_blocking = true},    // long control status
     {0x118, 0, 8, .check_relay = true, .disable_static_blocking = true},    // long/ESP handshake
+    {0x52A, 2, 8, .check_relay = true, .disable_static_blocking = true},    // ICC spoof (bus 2)
   };
 
   static RxCheck fisker_rx_checks[] = {
@@ -236,6 +240,18 @@ static bool fisker_fwd_hook(int bus_num, int addr) {
     // Longitudinal (0x121) is unaffected by MADS — MADS is lateral-only. Only block the
     // OEM's accel when cruise is engaged and openpilot is driving longitudinal.
     if (fisker_longitudinal && (addr == 0x121) && controls_allowed) {
+      block_msg = true;
+    }
+  }
+  if (bus_num == 0) {
+    // ICC settings frame 0x52A: authored by ICC on bus 0, consumed by ADAS/FCM on bus 2.
+    // While cruise is engaged (controls_allowed), openpilot repacks it with
+    // ICCACCFuncTyp=2 and injects the modified copy on bus 2 — so block OEM's original
+    // from crossing the panda in that direction. When cruise is disengaged, forward the
+    // OEM's frame untouched so ADAS/FCM keep seeing ICC's real settings. MADS-alone is
+    // deliberately NOT included in this gate; the spoof exists to override the ACC
+    // function type, which only matters while ACC is actually active.
+    if ((addr == 0x52A) && controls_allowed) {
       block_msg = true;
     }
   }

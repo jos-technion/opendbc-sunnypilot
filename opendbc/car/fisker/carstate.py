@@ -40,6 +40,44 @@ _BUTTON_TYPE = {
 BUTTON_SIGNAL_TO_TYPE = {sig: _BUTTON_TYPE[name] for sig, name in BUTTON_MAP.items()}
 
 
+# Every signal in ICC_0x52A. Enumerated once here so carstate snapshots the whole frame
+# and the carcontroller can round-trip it into the spoofed packet with only
+# ICCACCFuncTyp overridden. The two "_Rsv" signals cover bits 49 and 55 (undefined in
+# the source spec) so byte 6 is fully accounted for.
+ICC_0x52A_SIGNALS = (
+  "ICC_0x52ACheckSum",
+  "ICC_0x52AAliveCounter",
+  "ICC_FACMDynmcSenstvty",
+  "ICCUsrProfTiGapSet",
+  "ICC_LKASetting",
+  "ICC_FACMSetting",
+  "ICC_AEBSensitivity",
+  "ICC_BACMSetting",
+  "ICC_BACMSensitivity",
+  "ICC_AEBJerkSetReq",
+  "ICCActvStyGlblSetting",
+  "ICC_TSRSetting",
+  "ICC_ESASetting",
+  "ICCELKASteeringInterventionSet",
+  "ICCLaneTrajectorySetting",
+  "ICCACCSwt",
+  "ICCACCAutoSpdSts",
+  "ICCACCSpdStepSize",
+  "ICCACCFuncTyp",
+  "ICCACCSpdLimOffs",
+  "ICCACCSpdLimOffsTyp",
+  "ICCACCTerrainSetting",
+  "ICC_0x52A_Rsv49",
+  "ICCACCTiGapCfm",
+  "ICCISASetting",
+  "ICC_0x52A_Rsv55",
+  "ICC_FCTASensitivity",
+  "ICCISAWarnStopReq",
+  "ICC_TLRSetting",
+  "ICC_FCTA_Setting",
+)
+
+
 class CarState(CarStateBase):
   def __init__(self, CP, CP_SP):
     super().__init__(CP, CP_SP)
@@ -65,6 +103,17 @@ class CarState(CarStateBase):
     self.oem_1d0_alive = 0
     self.oem_1c0_alive = 0
     self.oem_1d0_secoc_wire_ctr = 0    # (byte >> 2) & 0x3F — lower 6 bits of msg_counter
+
+    # ICC_0x52A cached values. This is the ICC settings frame we spoof on bus 2 when
+    # cruise is engaged: we forward every OEM signal untouched EXCEPT ICCACCFuncTyp
+    # (which we force to 2 so the ADAS module treats us as "type-2" ACC). Storing the
+    # whole signal dict makes the carcontroller a pure passthrough+mutate — every
+    # signal ICC set (including the reserved bits ICC_0x52A_Rsv{49,55}) round-trips
+    # into our spoofed packet unchanged. `icc_52a_alive` is used to detect a new OEM
+    # tick so we emit exactly one spoofed frame per OEM tick (no duplicates, no gaps).
+    self.icc_52a_values: dict[str, float] = {}
+    self.icc_52a_alive = -1     # sentinel; -1 means "no ICC frame seen yet"
+    self.icc_52a_seen = False
 
     # Button state edge detection
     self._prev_button_state = {sig: 0 for sig in BUTTON_SIGNAL_TO_TYPE}
@@ -206,6 +255,16 @@ class CarState(CarStateBase):
     self.oem_1c0_alive = int(oem_1c0["ADAS_1C0_AliveCounter"])
     self.oem_1d0_secoc_wire_ctr = (int(oem_1d0["ADAS_1D0_SSecOC_Fresh_Byte0"]) >> 2) & 0x3F
 
+    # ---- ICC settings frame (0x52A) — snapshot for the spoof --------------
+    # ICC broadcasts 0x52A on bus 0 at ~10 Hz. We forward every field into a
+    # dict; the carcontroller re-packs it (with ICCACCFuncTyp forced to 2) and
+    # emits it on bus 2. Include the reserved-bit signals so a firmware that
+    # sets bits 49/55 to something non-zero still round-trips faithfully.
+    icc52a = cp_pt.vl["ICC_0x52A"]
+    self.icc_52a_values = {k: icc52a[k] for k in ICC_0x52A_SIGNALS}
+    self.icc_52a_alive = int(icc52a["ICC_0x52AAliveCounter"])
+    self.icc_52a_seen = True
+
     # ---- SecOC sync (GW_Syn_All 0x20) ----
     # Trip counter = 2 bytes BE, Reset counter = 3 bytes BE, MAC = 3 bytes.
     sync = cp_pt.vl["GW_Syn_All"]
@@ -244,6 +303,7 @@ class CarState(CarStateBase):
       # message stale -> carState.canValid=False -> commIssue. Measured on ADASBUS.
       ("VCU_0x358", 10),    # basic cruise-control (CC) state + set speed (~10 Hz)
       ("ICC_0x531", 10),
+      ("ICC_0x52A", 10),    # ICC settings frame — we spoof this on bus 2 with ICCACCFuncTyp=2
       ("GW_Syn_All", 2),    # SecOC sync (~3 Hz)
       # Gateway-mirrored body/HMI (also present on ADASBUS)
       ("VCU_0x214", 50),    # gear, accel pedal %, brake

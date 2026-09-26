@@ -45,12 +45,39 @@ def fisker_plain_checksum(addr: int, data: bytes) -> int:
   data_id, data_len_bits = E2E_PARAMS[addr]
   n_bytes = data_len_bits // 8
   crc_input = bytes([data_id]) + data[1:n_bytes]
+  return _crc8_j1850(crc_input)
+
+
+def _crc8_j1850(buf: bytes) -> int:
+  """SAE-J1850 CRC-8 (poly=0x1D, init=0, xorout=0), reflected form matching
+  fisker_plain_checksum's inner loop. Broken out for the ICC spoof helpers so
+  they can compute checksum deltas without needing the per-address data_id."""
   crc = 0
-  for b in crc_input:
+  for b in buf:
     crc ^= b
     for _ in range(8):
       crc = ((crc << 1) ^ 0x1D) & 0xFF if crc & 0x80 else (crc << 1) & 0xFF
   return crc
+
+
+def fisker_icc_checksum_delta(byte_diff: bytes) -> int:
+  """
+  Return the XOR delta to apply to ICC's 8-bit CheckSum byte after mutating the
+  payload of an ICC-authored message.
+
+  Reasoning: the CheckSum is CRC-8 J1850 with init=0, xorout=0 over
+  [DataID] || payload[1:8]. That CRC is linear over GF(2):
+      crc(A XOR B) = crc(A) XOR crc(B)
+  So for a payload change P_orig -> P_new (both 8 bytes),
+      new_chk = old_chk XOR crc([0] || (P_orig XOR P_new)[1:8])
+  and we never need to know DataID.
+
+  `byte_diff` MUST be 8 bytes long and byte_diff[0] MUST be 0 (the checksum
+  position — its "delta" is exactly what we're computing, so it can't be an
+  input). Non-zero bytes at positions 1..7 are XOR'd into the CRC.
+  """
+  assert len(byte_diff) == 8 and byte_diff[0] == 0
+  return _crc8_j1850(byte_diff)
 
 
 class FiskerCAN:
@@ -215,3 +242,45 @@ class FiskerCAN:
       "ADAS_DrvrTakeOvrReq": takeover & 0x3,
     }
     return self.packer.make_can_msg("ADAS_0x317", CANBUS.pt, values)
+
+  # ---- ICC spoof (bus 2, replaces the OEM ICC 0x52A when engaged) ---------
+
+  def create_icc_spoof_0x52a(self, icc_values: dict):
+    """Repack ICC_0x52A on the cam-side bus with ICCACCFuncTyp forced to 2.
+
+    `icc_values` is a snapshot of every ICC_0x52A signal (see
+    fisker.carstate.ICC_0x52A_SIGNALS) captured on bus 0. Every field —
+    including the OEM CheckSum, AliveCounter, and reserved bits — is passed
+    through untouched so the spoofed frame is byte-identical to what ICC just
+    sent, EXCEPT byte 4's top 3 bits (ICCACCFuncTyp) which get set to 2. The
+    CheckSum is then adjusted via a CRC-8 XOR delta (see
+    fisker_icc_checksum_delta) so we don't need to know 0x52A's per-message
+    DataID to regenerate a valid CRC.
+
+    Bus routing: sent on CANBUS.cam (bus 2, ADAS side). Panda's fisker_fwd_hook
+    blocks OEM's bus-0 → bus-2 forwarding of 0x52A during the same engaged
+    window, so ADAS sees exactly one 0x52A per OEM tick — ours."""
+    ADDR = 0x52A
+    # First, round-trip through the packer to lay out every bit at OEM's values.
+    # CANPacker doesn't treat "*CheckSum" as anything special — it just packs the
+    # numeric value we give it — so we preserve OEM's CheckSum byte here and then
+    # patch it via the CRC delta once byte 4 is mutated.
+    addr, data, _ = self.packer.make_can_msg("ICC_0x52A", CANBUS.pt, icc_values)
+    assert addr == ADDR
+
+    orig_b4 = data[4]
+    # ICCACCFuncTyp lives in bits 39..37 (top 3 bits of byte 4). Set them to 010 = 2
+    # while preserving the other 5 signals in this byte (ICCLaneTrajectorySetting,
+    # ICCACCSwt, ICCACCAutoSpdSts, ICCACCSpdStepSize).
+    new_b4 = (orig_b4 & 0x1F) | (0b010 << 5)
+
+    if new_b4 != orig_b4:
+      diff = bytearray(8)
+      diff[4] = orig_b4 ^ new_b4
+      delta_chk = fisker_icc_checksum_delta(bytes(diff))
+      out = bytearray(data)
+      out[0] ^= delta_chk
+      out[4] = new_b4
+      data = bytes(out)
+
+    return ADDR, data, CANBUS.cam

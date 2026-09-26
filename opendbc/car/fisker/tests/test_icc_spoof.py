@@ -1,0 +1,185 @@
+"""
+Tests for the ICC 0x52A spoof. We don't know ICC 0x52A's E2E DataID, but the
+CheckSum is CRC-8 J1850 with init=0/xorout=0 over ([DataID] || payload[1:8]),
+which is LINEAR over GF(2). fisker_icc_checksum_delta exploits that linearity
+to compute the new checksum from just the byte-diff, without ever needing the
+DataID. These tests pin that mathematical property, then check that
+create_icc_spoof_0x52a end-to-end preserves every other byte and flips
+ICCACCFuncTyp to 2.
+"""
+
+import pytest
+
+from opendbc.can import CANPacker
+from opendbc.car.fisker.fiskercan import (
+  FiskerCAN,
+  _crc8_j1850,
+  fisker_icc_checksum_delta,
+)
+from opendbc.car.fisker.values import CANBUS, CAR, DBC
+from opendbc.car import Bus
+
+
+# Exhaustively sanity-check the XOR-linearity: for a range of hypothetical
+# DataIDs and payloads, verify that (orig_crc XOR delta) equals the CRC
+# recomputed from scratch after the same mutation.
+@pytest.mark.parametrize("data_id", [0, 1, 16, 42, 128, 195, 255])
+@pytest.mark.parametrize("orig_payload", [
+  bytes.fromhex("00000000000000"),
+  bytes.fromhex("FFFFFFFFFFFFFF"),
+  bytes.fromhex("123456789ABCDE"),
+  bytes.fromhex("DEADBEEFCAFE01"),
+])
+@pytest.mark.parametrize("new_b4_top3", [0, 1, 2, 3, 5, 7])
+def test_icc_checksum_delta_matches_from_scratch(data_id, orig_payload, new_b4_top3):
+  # `orig_payload` is 7 bytes: what would sit at frame bytes [1..8).
+  # frame byte 4 == orig_payload[3].
+  b4_orig = orig_payload[3]
+  b4_new = (b4_orig & 0x1F) | ((new_b4_top3 & 0x7) << 5)
+
+  orig_crc = _crc8_j1850(bytes([data_id]) + orig_payload)
+
+  new_payload = bytearray(orig_payload)
+  new_payload[3] = b4_new
+  scratch_crc = _crc8_j1850(bytes([data_id]) + bytes(new_payload))
+
+  diff = bytearray(8)
+  diff[4] = b4_orig ^ b4_new
+  delta = fisker_icc_checksum_delta(bytes(diff))
+  delta_crc = orig_crc ^ delta
+
+  assert delta_crc == scratch_crc, (
+    f"linearity broke: data_id={data_id:02X} b4 {b4_orig:02X}->{b4_new:02X} "
+    f"scratch={scratch_crc:02X} via_delta={delta_crc:02X}"
+  )
+
+
+def _icc_signal_defaults():
+  """Return a dict with every ICC_0x52A signal set to 0 (matches
+  fisker.carstate.ICC_0x52A_SIGNALS)."""
+  return {
+    "ICC_0x52ACheckSum": 0,
+    "ICC_0x52AAliveCounter": 0,
+    "ICC_FACMDynmcSenstvty": 0,
+    "ICCUsrProfTiGapSet": 0,
+    "ICC_LKASetting": 0,
+    "ICC_FACMSetting": 0,
+    "ICC_AEBSensitivity": 0,
+    "ICC_BACMSetting": 0,
+    "ICC_BACMSensitivity": 0,
+    "ICC_AEBJerkSetReq": 0,
+    "ICCActvStyGlblSetting": 0,
+    "ICC_TSRSetting": 0,
+    "ICC_ESASetting": 0,
+    "ICCELKASteeringInterventionSet": 0,
+    "ICCLaneTrajectorySetting": 0,
+    "ICCACCSwt": 0,
+    "ICCACCAutoSpdSts": 0,
+    "ICCACCSpdStepSize": 0,
+    "ICCACCFuncTyp": 0,
+    "ICCACCSpdLimOffs": 0,
+    "ICCACCSpdLimOffsTyp": 0,
+    "ICCACCTerrainSetting": 0,
+    "ICC_0x52A_Rsv49": 0,
+    "ICCACCTiGapCfm": 0,
+    "ICCISASetting": 0,
+    "ICC_0x52A_Rsv55": 0,
+    "ICC_FCTASensitivity": 0,
+    "ICCISAWarnStopReq": 0,
+    "ICC_TLRSetting": 0,
+    "ICC_FCTA_Setting": 0,
+  }
+
+
+def _make_fcan():
+  packer = CANPacker(DBC[CAR.FISKER_OCEAN][Bus.pt])
+  return FiskerCAN(CP=None, packer=packer), packer
+
+
+def test_spoof_sets_funcTyp_to_2_and_routes_to_cam_bus():
+  fcan, _ = _make_fcan()
+  addr, data, bus = fcan.create_icc_spoof_0x52a(_icc_signal_defaults())
+  assert addr == 0x52A
+  assert bus == CANBUS.cam
+  # ICCACCFuncTyp lives in byte 4 bits 39..37 (top 3 bits). 2 << 5 = 0x40.
+  assert (data[4] >> 5) & 0x07 == 2
+  # All other bits in byte 4 stayed 0 (we passed 0 defaults for LaneTrajectory,
+  # Swt, AutoSpdSts, SpdStepSize).
+  assert data[4] == 0x40
+
+
+def test_spoof_preserves_non_byte4_signals():
+  fcan, packer = _make_fcan()
+  # Choose distinct non-zero values across many signals so we can see them survive.
+  vals = _icc_signal_defaults()
+  vals.update({
+    "ICC_0x52AAliveCounter": 11,
+    "ICCUsrProfTiGapSet": 5,
+    "ICC_LKASetting": 2,
+    "ICC_FACMSetting": 3,
+    "ICC_AEBSensitivity": 1,
+    "ICC_BACMSetting": 2,
+    "ICCACCSpdLimOffs": 12,
+    "ICCACCSpdLimOffsTyp": 2,
+    "ICCACCTerrainSetting": 1,
+    "ICCACCTiGapCfm": 2,
+    "ICCISASetting": 5,
+    "ICC_FCTASensitivity": 3,
+    "ICC_TLRSetting": 4,
+    "ICC_FCTA_Setting": 2,
+    # ICCACCFuncTyp starts as 7 to prove the spoof forces it back to 2.
+    "ICCACCFuncTyp": 7,
+    # Other byte-4 signals to prove they are preserved.
+    "ICCLaneTrajectorySetting": 1,
+    "ICCACCSwt": 3,
+    "ICCACCAutoSpdSts": 1,
+    "ICCACCSpdStepSize": 1,
+  })
+
+  # What the OEM would pack (no spoof) — for byte-by-byte comparison.
+  _, oem_frame, _ = packer.make_can_msg("ICC_0x52A", CANBUS.pt, vals)
+
+  # And the spoofed version.
+  _, spoofed, spoofed_bus = fcan.create_icc_spoof_0x52a(vals)
+  assert spoofed_bus == CANBUS.cam
+
+  # Only byte 0 (checksum patch) and byte 4 (FuncTyp force) should differ.
+  differing = [i for i in range(8) if spoofed[i] != oem_frame[i]]
+  assert differing == [0, 4], f"unexpected byte changes: {differing}"
+
+  # Byte 4 top 3 bits are now 010 (=2). Bottom 5 bits are unchanged from OEM.
+  assert (spoofed[4] >> 5) & 0x07 == 2
+  assert (spoofed[4] & 0x1F) == (oem_frame[4] & 0x1F)
+
+
+def test_spoof_checksum_stays_valid_for_arbitrary_hypothetical_data_id():
+  """Even without knowing 0x52A's real DataID, the XOR-linearity guarantees
+  that if the incoming frame's checksum was valid under some data_id, our
+  spoofed frame's checksum will also be valid under that same data_id."""
+  fcan, packer = _make_fcan()
+
+  vals = _icc_signal_defaults()
+  vals.update({
+    "ICC_0x52AAliveCounter": 5,
+    "ICCACCFuncTyp": 4,          # arbitrary "OEM" value
+    "ICCACCSwt": 2,
+    "ICCACCSpdLimOffs": 20,
+    "ICCISASetting": 3,
+  })
+
+  # Simulate: pick an arbitrary DataID, compute the "valid" checksum, and
+  # stuff it into ICC_0x52ACheckSum. Then run the spoof and verify the new
+  # checksum is still valid under that same DataID.
+  for hypothetical_data_id in (0x00, 0x2A, 0x7F, 0xFF):
+    vals["ICC_0x52ACheckSum"] = 0
+    _, packed_with_zero_chk, _ = packer.make_can_msg("ICC_0x52A", CANBUS.pt, vals)
+    valid_chk = _crc8_j1850(bytes([hypothetical_data_id]) + packed_with_zero_chk[1:])
+    vals["ICC_0x52ACheckSum"] = valid_chk
+
+    _, spoofed, _ = fcan.create_icc_spoof_0x52a(vals)
+    # Re-derive what a CRC-8 J1850 with that DataID would produce for the spoofed payload.
+    scratch = _crc8_j1850(bytes([hypothetical_data_id]) + spoofed[1:])
+    assert spoofed[0] == scratch, (
+      f"spoof checksum invalid under data_id={hypothetical_data_id:02X}: "
+      f"got {spoofed[0]:02X}, expected {scratch:02X}"
+    )
