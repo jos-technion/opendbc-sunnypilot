@@ -206,21 +206,30 @@ class CarState(CarStateBase):
     ret.leftBlindspot = bsm_available and le_disp in (1, 2, 3)
     ret.rightBlindspot = bsm_available and ri_disp in (1, 2, 3)
 
-    # ---- Cruise state (VCU basic cruise control) ----
-    # openpilot intercepts the ADAS module, so its ACC frames (0x313/0x31C) are on the
-    # isolated side (bus 2) and not on the bus we read. The car uses the VCU's basic
-    # hold-speed cruise (VCU_Sts_CC_ICC, 0x358), which is gateway-sourced and native to
-    # bus 0. Enum: 0=Off 1=Init 2=Standby 3=Active 4=Override 9/10=Fault (no standstill).
-    # Set speed VCU_CcTrgSpdDisp is in the driver-selected unit (VCU_DispSpdUnit_CC VAL_:
-    # 0=KMH,1=MPH); 255=no_display. Populate speedCluster too so the UI "MAX" box renders.
-    vcu358 = cp_pt.vl["VCU_0x358"]
-    cc_state = int(vcu358["VCU_Sts_CC_ICC"])
-    cc_disp = vcu358["VCU_CcTrgSpdDisp"]
-    cc_speed = 0.0 if cc_disp >= 255 else cc_disp * (CV.MPH_TO_MS if vcu358["VCU_DispSpdUnit_CC"] == 1 else CV.KPH_TO_MS)
+    # ---- Cruise state (ADAS ACC — ADAS_0x313 + ADAS_0x31C on cam bus) ----
+    # Cruise now comes from the ADAS module rather than the VCU basic-CC path. Now that
+    # the ICC_0x52A spoof forces ICCACCFuncTyp=2, ADAS enters full ACC mode (not just
+    # VCU hold-speed), so its own ADAS_Sts_ACC_ICC and ADAS_AccTrgSpdDisp are the
+    # authoritative signals for state + set speed. Both messages originate on bus 2
+    # (cam side) — pandad tags them with src=2 even after panda forwards to bus 0, so a
+    # CANParser subscribed to bus 0 doesn't see them (see cam parser in
+    # get_can_parsers).
+    # ADAS_Sts_ACC_ICC enum: 0=ACC_Off, 1=Init, 2=Standby, 3=Active, 4=Override,
+    # 5=Standstill_active, 6=Standstill_wait, 7=Deactivation_brake, 8=Deactivation_other,
+    # 9=Failure_reversible, 10=Failure_irreversible, 11=Standstill_GoNotification.
+    # We treat every "commanding" state (3/4) AND the standstill variants (5/6/11) as
+    # engaged — the ACC controller is holding the car in all of them.
+    # ADAS_AccTrgSpdDisp is 0..254 in the driver-selected unit (ADAS_DispSpdUnit_ACC
+    # VAL_: 0=KMH,1=MPH); 255=no_display.
+    adas313 = cp_cam.vl["ADAS_0x313"]
+    adas31c = cp_cam.vl["ADAS_0x31C"]
+    cc_state = int(adas313["ADAS_Sts_ACC_ICC"])
+    cc_disp = adas31c["ADAS_AccTrgSpdDisp"]
+    cc_speed = 0.0 if cc_disp >= 255 else cc_disp * (CV.MPH_TO_MS if adas31c["ADAS_DispSpdUnit_ACC"] == 1 else CV.KPH_TO_MS)
 
-    ret.cruiseState.enabled = cc_state in (3, 4)
+    ret.cruiseState.enabled = cc_state in (3, 4, 5, 6, 11)
     ret.cruiseState.available = cc_state not in (0, 1, 9, 10)
-    ret.cruiseState.standstill = False
+    ret.cruiseState.standstill = cc_state in (5, 6, 11)
     ret.cruiseState.speed = cc_speed
     ret.cruiseState.speedCluster = cc_speed
 
@@ -241,6 +250,9 @@ class CarState(CarStateBase):
     ret.buttonEvents = button_events
 
     # ---- Faults ----
+    # ADAS_Sts_ACC_ICC 9/10 = Failure_reversible/irreversible (same enum position as
+    # the old VCU_Sts_CC_ICC path — the fault codes carry the same meaning across
+    # both authors).
     ret.accFaulted = cc_state in (9, 10) or bool(cp_pt.vl["ESP_0x114"]["ESP_FltIndcn_AEB"])
 
     # ---- OEM ADAS lateral counters (bus 2, for takeover alignment) --------
@@ -301,7 +313,6 @@ class CarState(CarStateBase):
       # (2) even after panda forwards it to bus 0 for the cluster.
       # Freqs are the real on-vehicle rates; over-declaring makes the CANParser flag a
       # message stale -> carState.canValid=False -> commIssue. Measured on ADASBUS.
-      ("VCU_0x358", 10),    # basic cruise-control (CC) state + set speed (~10 Hz)
       ("ICC_0x531", 10),
       ("ICC_0x52A", 10),    # ICC settings frame — we spoof this on bus 2 with ICCACCFuncTyp=2
       ("GW_Syn_All", 2),    # SecOC sync (~3 Hz)
@@ -316,8 +327,10 @@ class CarState(CarStateBase):
     # onto bus 0 for the cluster, but pandad tags each packet with the src bus it was
     # originally received on — so a CANParser subscribed to bus 0 doesn't see them.
     cam_msgs = [
+      ("ADAS_0x313", 50),   # ADAS ACC state (ADAS_Sts_ACC_ICC) — authoritative cruise state
       ("ADAS_0x314", 50),   # BSDSts + LKA/ELKA state enums
       ("ADAS_0x315", 20),   # BSD_CID_{Le,Ri}DispReq — blind-spot alert
+      ("ADAS_0x31C", 20),   # ACC HUD — ADAS_AccTrgSpdDisp + ADAS_DispSpdUnit_ACC (set speed)
       # OEM ADAS's lateral commands on bus 2 — we snapshot the AliveCounters and SecOC
       # wire freshness byte so carcontroller can align its transmitted counters to what
       # the EPS was tracking BEFORE the panda takeover blocked OEM's stream. Rejection on

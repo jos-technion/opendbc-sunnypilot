@@ -251,6 +251,18 @@ BO_ 532 VCU_0x214: 16 GW
  SG_ VCU_214_SSecOC_MAC_Byte1 : 87|8@0+ (1,0) [0|255] ""  ADASBUS_Virtual_ECU
  SG_ VCU_214_SSecOC_MAC_Byte2 : 95|8@0+ (1,0) [0|255] ""  ADASBUS_Virtual_ECU
 
+BO_ 787 ADAS_0x313: 8 ADAS
+ SG_ ADAS_313_CheckSum : 7|8@0+ (1,0) [0|255] ""  FCM,GW
+ SG_ ADAS_313_AliveCounter : 11|4@0+ (1,0) [0|14] ""  FCM,GW
+ SG_ ADAS_FACM_Sts : 19|4@0+ (1,0) [0|15] ""  GW
+ SG_ ADAS_BACM_Sts : 23|4@0+ (1,0) [0|15] ""  GW
+ SG_ AEB_ReAEB_Sts : 27|4@0+ (1,0) [0|15] ""  GW
+ SG_ ADAS_Sts_ACC_ICC : 35|4@0+ (1,0) [0|15] ""  FCM,GW
+ SG_ ADAS_TJA_AutoSteerSts : 38|3@0+ (1,0) [0|7] ""  GW
+ SG_ ADAS_ISASts : 46|2@0+ (1,0) [0|3] ""  GW
+ SG_ ADAS_Sts_TLR : 50|2@0+ (1,0) [0|3] ""  GW
+ SG_ ADAS_TSRSts : 53|3@0+ (1,0) [0|7] ""  GW
+
 BO_ 788 ADAS_0x314: 8 ADAS
  SG_ ADAS_314_CheckSum : 7|8@0+ (1,0) [0|255] ""  FCM,GW
  SG_ ADAS_314_AliveCounter : 11|4@0+ (1,0) [0|14] ""  FCM,GW
