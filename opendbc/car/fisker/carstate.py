@@ -122,6 +122,11 @@ class CarState(CarStateBase):
     self.eps_abort = 0               # EPS_AbortFb enum
     self.eps_sts_ever_valid = False  # latches once EPS_AdasLatCtrlStsVld == 1
 
+    # Driver-intervention bit (EPS_DrvrIntvSteerWhlDetd). Separate from steeringPressed:
+    # steeringPressed is sensitive (light touch) for auto-lane-change / UI; this is
+    # conservative (real overpower) for the EPS release in carcontroller. See update().
+    self.driver_intervening = False
+
     # Button state edge detection
     self._prev_button_state = {sig: 0 for sig in BUTTON_SIGNAL_TO_TYPE}
 
@@ -167,20 +172,32 @@ class CarState(CarStateBase):
     ret.steeringTorque = drvr_tq_mag * (-1.0 if int(drvr_tq_dir) == 1 else 1.0)
     ret.steeringTorqueEps = eps_ang["EPS_AsscMotCrtTq"]
 
-    # Driver intervention: prefer EPS's dedicated bit (EPS_DrvrIntvSteerWhlDetd on
-    # 0x1C4) over a column-torque threshold. EPS_DrvrSteerTq reports torque on the
-    # whole steering column — INCLUDING the servo motor's own reaction torque while
-    # LKA/TJA is active — so a threshold on it false-fires during normal engagement
-    # and silently drops Req=0, cancelling steering. The dedicated bit is computed
-    # by the EPS with internal knowledge of its own motor contribution, so it only
-    # trips on real driver input. Fall back to the torque threshold if the EPS
-    # reports the intervention bit as Initializing/Invalid (StsVld != Valid).
+    # Two different "driver is touching the wheel" concepts, with different sources:
+    #
+    #   ret.steeringPressed  <- light column-torque threshold (sensitive)
+    #     Consumed by sunnypilot for auto-lane-change ("blinker on + lean the wheel
+    #     that way"), nudge-steer alerts, and the standard steering-pressed UI. A
+    #     user tap for a lane change barely registers on the dedicated intervention
+    #     bit, so if we drove this off that bit, ALC would silently stop working.
+    #     The column torque is noisy during active LKA (includes motor reaction)
+    #     but openpilot's lane-change gates it behind blinker anyway, so stray
+    #     false-fires don't cause spurious lane changes.
+    #
+    #   self.driver_intervening  <- EPS's dedicated EPS_DrvrIntvSteerWhlDetd bit
+    #     Consumed by carcontroller for the EPS release (drop ADAS_LatCtrl_Req=0
+    #     so the EPS stops servoing). We want this to only trip on real driver
+    #     overpower, not a tap — the EPS computes it with internal knowledge of
+    #     its motor contribution, so it doesn't false-fire from reaction torque
+    #     the way a plain column-torque threshold does. Fall back to the torque
+    #     threshold only if the EPS reports the intervention bit as
+    #     Initializing/Invalid, so we always have *some* release trigger.
+    ret.steeringPressed = self.update_steering_pressed(abs(ret.steeringTorque) > STEER_THRESHOLD, 5)
     drvr_intv_vld = int(eps_tq["EPS_DrvrIntvSteerWhlVld"]) == 1
     drvr_intv = int(eps_tq["EPS_DrvrIntvSteerWhlDetd"]) == 1
     if drvr_intv_vld:
-      ret.steeringPressed = self.update_steering_pressed(drvr_intv, 5)
+      self.driver_intervening = drvr_intv
     else:
-      ret.steeringPressed = self.update_steering_pressed(abs(ret.steeringTorque) > STEER_THRESHOLD, 5)
+      self.driver_intervening = abs(ret.steeringTorque) > STEER_THRESHOLD
 
     # EPS lateral control state (EPS_AdasLatCtrlSts on 0x1C2):
     #   0=Off, 1=Available_For_Control, 2=Active, 3=Failure

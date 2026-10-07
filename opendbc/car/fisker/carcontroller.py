@@ -126,19 +126,20 @@ class CarController(CarControllerBase):
     # (e.g. MADS engaged without cruise), the EPS receives NEITHER openpilot's frames
     # nor the OEM's (panda blocks the OEM's) → LKA fault + wheel doesn't move.
     #
-    # Driver-torque override (release EPS on steeringPressed). CS.out.steeringPressed
-    # is now driven by the EPS's dedicated EPS_DrvrIntvSteerWhlDetd bit (0x1C4), which
-    # excludes motor reaction torque, so unlike the previous attempt it only trips on
-    # real driver input. When the driver is intervening we drop lat_active so
-    # ADAS_LatCtrl_Req goes to 0 and the EPS stops servoing against the wheel — this
-    # is what lets the driver co-steer. steeringAngleDeg continues to update though
-    # (we mirror the measured angle while inactive so there's no step change when the
-    # user releases and lat_active snaps back to True), and the whole engaged envelope
-    # stays open so the EPS doesn't fault on a disappearing 0x1C0. `driver_override`
-    # on the wire is still 0 — it's a GW-only diagnostic, EPS doesn't read it.
+    # Driver-override release. CS.driver_intervening is driven by the EPS's dedicated
+    # EPS_DrvrIntvSteerWhlDetd bit (0x1C4) — a conservative "real driver overpower"
+    # signal that EPS computes with internal knowledge of its motor contribution, so
+    # it doesn't false-fire from reaction torque the way a plain column-torque
+    # threshold does. When it trips we drop lat_active so ADAS_LatCtrl_Req=0 and the
+    # EPS stops servoing. We intentionally do NOT key this off CS.out.steeringPressed
+    # — that's the sensitive, column-torque-based "driver is touching the wheel"
+    # signal, and consuming it here caused the EPS to release on every light nudge
+    # (which also killed sunnypilot's auto-lane-change nudge detection since ALC
+    # watches steeringPressed too). Separating the two sensitivities lets light
+    # nudges feed ALC while hard overpower releases the EPS.
     mads_engaged = bool(CC_SP.mads.enabled) if CC_SP is not None else False
     engaged = (CS.out.cruiseState.enabled or mads_engaged) and secoc_ok
-    lat_active = CC.latActive and secoc_ok and not CS.out.steeringPressed
+    lat_active = CC.latActive and secoc_ok and not CS.driver_intervening
     self.apply_angle_last = apply_std_steer_angle_limits(
       actuators.steeringAngleDeg, self.apply_angle_last, CS.out.vEgoRaw,
       CS.out.steeringAngleDeg, lat_active, self.params.ANGLE_LIMITS,
@@ -207,14 +208,14 @@ class CarController(CarControllerBase):
       steer_msg = self.fcan.create_steering_control(self.apply_angle_last, self.alive_1d0)
       can_sends.append(self._stamp(steer_msg, STEER_CAN_ID, trip, reset, self.secoc_window_ctr))
       # Also assert driver_override on the wire when the EPS tells us the driver is
-      # intervening. DBC lists ADAS_LatCtrl_DrvrOvrd as GW-only (receivers=[GW]) so the
-      # EPS is not spec'd to read it, but firmware sometimes reads what the DBC says it
-      # shouldn't — zero cost to flip the bit and see if it affects the EPS's internal
-      # counter-torque gain. If no on-vehicle difference is observed, this can be
-      # reverted to False. The Req=0 release above is the actual driver-override
-      # mechanism; this bit is just a bonus signal.
+      # overpowering (same conservative signal that drives the Req=0 release above).
+      # DBC lists ADAS_LatCtrl_DrvrOvrd as GW-only (receivers=[GW]) so the EPS is not
+      # spec'd to read it, but firmware sometimes reads what the DBC says it shouldn't
+      # — zero cost to flip the bit and see if it affects the EPS's internal
+      # counter-torque gain. The Req=0 release is the actual override mechanism; this
+      # bit is just a bonus signal.
       can_sends.append(self.fcan.create_lat_control(lat_active, self.alive_1c0,
-                                                    driver_override=CS.out.steeringPressed,
+                                                    driver_override=CS.driver_intervening,
                                                     lat_ctrl_typ=lat_ctrl_typ))
 
     # ---- Longitudinal (accel 0x121 + status 0x117/0x118 @ 100 Hz) ----
