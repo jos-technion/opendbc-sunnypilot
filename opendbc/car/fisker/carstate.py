@@ -219,13 +219,19 @@ class CarState(CarStateBase):
     # 9=Failure_reversible, 10=Failure_irreversible, 11=Standstill_GoNotification.
     # We treat every "commanding" state (3/4) AND the standstill variants (5/6/11) as
     # engaged — the ACC controller is holding the car in all of them.
-    # ADAS_AccTrgSpdDisp is 0..254 in the driver-selected unit (ADAS_DispSpdUnit_ACC
-    # VAL_: 0=KMH,1=MPH); 255=no_display.
+    #
+    # ADAS_AccTrgSpdDisp (set speed) is 0..254 in the driver-selected unit;
+    # 255=no_display. The DBC pairs it with ADAS_DispSpdUnit_ACC but on real cars that
+    # bit is hardcoded to 0 (doesn't track the cluster), so trusting it on a car whose
+    # ADAS passes the mph cluster number through unchanged silently applies the km/h
+    # factor and shows ~0.62x low (20 displayed → 12). ICC_DispVehSpdUnit (read above
+    # for vEgoCluster) is the reliable source for the driver's unit, so reuse the
+    # icc_to_ms factor here too.
     adas313 = cp_cam.vl["ADAS_0x313"]
     adas31c = cp_cam.vl["ADAS_0x31C"]
     cc_state = int(adas313["ADAS_Sts_ACC_ICC"])
     cc_disp = adas31c["ADAS_AccTrgSpdDisp"]
-    cc_speed = 0.0 if cc_disp >= 255 else cc_disp * (CV.MPH_TO_MS if adas31c["ADAS_DispSpdUnit_ACC"] == 1 else CV.KPH_TO_MS)
+    cc_speed = 0.0 if cc_disp >= 255 else cc_disp * icc_to_ms
 
     ret.cruiseState.enabled = cc_state in (3, 4, 5, 6, 11)
     ret.cruiseState.available = cc_state not in (0, 1, 9, 10)
