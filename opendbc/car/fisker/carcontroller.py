@@ -253,26 +253,29 @@ class CarController(CarControllerBase):
                                                               counter=alive))
 
     # ---- ICC 0x52A spoof (bus 2) ----
-    # While cruise is engaged, replace the OEM ICC settings frame flowing bus 0 -> bus 2
-    # with a mutated copy that pins ICCACCFuncTyp to 2 — everything else (all other
-    # ICC settings + AliveCounter + reserved bits) is forwarded byte-identically, and
-    # the CheckSum is patched via XOR delta (no need to know 0x52A's DataID).
+    # Replace the OEM ICC settings frame flowing bus 0 -> bus 2 with a mutated copy
+    # that forces byte 4 to 0x5B (ICCACCSwt=1 + ICCACCFuncTyp=2 + 3 more — see
+    # create_icc_spoof_0x52a). Everything else (AliveCounter, reserved bits, other
+    # settings) passes through byte-identical, and the CheckSum is patched via XOR
+    # delta (no need to know 0x52A's DataID).
     #
-    # Panda's fisker_fwd_hook blocks the OEM's bus-0 -> bus-2 forwarding of 0x52A over
-    # the same engaged window, so the receiver (ADAS + FCM on bus 2) sees exactly one
-    # 0x52A per OEM tick: ours. Cadence: emit once per OEM tick (detected by
-    # AliveCounter change) so we never send duplicates that would trip the receiver's
-    # E2E monotonic-counter check. Gate is CS.out.cruiseState.enabled — MADS-alone is
-    # NOT included (the whole point of this spoof is to flip the ACC func type; there
-    # is no ACC state to flip while MADS is engaged without cruise).
-    icc_active = CS.out.cruiseState.enabled and CS.icc_52a_seen
-    if icc_active and CS.icc_52a_alive != self.last_spoofed_icc_alive:
+    # IMPORTANT: this must be sent UNCONDITIONALLY, not gated on
+    # cruiseState.enabled. ADAS stays at ACC_Off until it sees ICC_ACCSwt=1 (and the
+    # other byte-4 fields) in a valid 0x52A — i.e. the spoof is what enables ACC to
+    # transition out of Off into Standby/Active. Gating on cruiseState.enabled was
+    # chicken-and-egg: cruise can't become enabled without the spoof going out
+    # first, and the spoof was never sent because cruise wasn't enabled.
+    #
+    # Cadence: one spoof per OEM tick (detected by AliveCounter change) so we never
+    # emit duplicates that would trip ADAS's E2E monotonic-counter check. ICC runs
+    # at ~5 Hz; openpilot runs at 100 Hz, so most carcontroller ticks won't fire.
+    #
+    # Panda's fisker_fwd_hook blocks the OEM's bus-0 -> bus-2 forwarding of 0x52A
+    # whenever openpilot has recently emitted its own copy (time-gated, not
+    # controls_allowed-gated — same reason as above).
+    if CS.icc_52a_seen and CS.icc_52a_alive != self.last_spoofed_icc_alive:
       can_sends.append(self.fcan.create_icc_spoof_0x52a(CS.icc_52a_values))
       self.last_spoofed_icc_alive = CS.icc_52a_alive
-    if not icc_active:
-      # Reset so the next engagement's first tick emits immediately rather than
-      # waiting for an OEM AliveCounter tick to happen to differ from a stale value.
-      self.last_spoofed_icc_alive = -1
 
     # ---- HUD ----
     # Forwarding intercept: the OEM ADAS module stays alive on bus 2 and the panda

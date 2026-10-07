@@ -246,33 +246,44 @@ class FiskerCAN:
   # ---- ICC spoof (bus 2, replaces the OEM ICC 0x52A when engaged) ---------
 
   def create_icc_spoof_0x52a(self, icc_values: dict):
-    """Repack ICC_0x52A on the cam-side bus with ICCACCFuncTyp forced to 2.
+    """Repack ICC_0x52A on the cam-side bus with every ACC-related setting in byte 4
+    overridden so the ADAS module enters ACC mode. OEM only sets some of these to
+    something other than Off, and without ICC_ACCSwt=On the ADAS module stays at
+    ACC_Off no matter what the type field says — forcing all five together is what
+    enables ACC via the ICC spoof path.
 
     `icc_values` is a snapshot of every ICC_0x52A signal (see
-    fisker.carstate.ICC_0x52A_SIGNALS) captured on bus 0. Every field —
-    including the OEM CheckSum, AliveCounter, and reserved bits — is passed
-    through untouched so the spoofed frame is byte-identical to what ICC just
-    sent, EXCEPT byte 4's top 3 bits (ICCACCFuncTyp) which get set to 2. The
-    CheckSum is then adjusted via a CRC-8 XOR delta (see
-    fisker_icc_checksum_delta) so we don't need to know 0x52A's per-message
-    DataID to regenerate a valid CRC.
+    fisker.carstate.ICC_0x52A_SIGNALS) captured on bus 0. Every field outside byte 4
+    — including the OEM CheckSum, AliveCounter, and reserved bits — is passed
+    through untouched, so the spoofed frame is byte-identical to what ICC just sent
+    except for byte 4 and the one-byte CheckSum fix-up. The CheckSum is adjusted via
+    a CRC-8 XOR delta (see fisker_icc_checksum_delta) so we don't need to know
+    0x52A's per-message DataID.
+
+    Byte 4 bit layout (Motorola, MSB first, matches the DBC):
+      bits 39..37 (3) ICCACCFuncTyp            = 2 (Advanced/type-2 ACC)
+      bit 36      (1) ICCACCSpdStepSize        = 1 (Step_5_unit)
+      bit 35      (1) ICCACCAutoSpdSts         = 1 (On)
+      bits 34..33 (2) ICCACCSwt                = 1 (On) — ACC master switch
+      bit 32      (1) ICCLaneTrajectorySetting = 1 (On)
+    All 5 bit-fields cover byte 4 completely, so byte 4 becomes a constant 0x5B
+    regardless of what OEM sent:
+      0x5B = (2 << 5) | (1 << 4) | (1 << 3) | (1 << 1) | 1
 
     Bus routing: sent on CANBUS.cam (bus 2, ADAS side). Panda's fisker_fwd_hook
-    blocks OEM's bus-0 → bus-2 forwarding of 0x52A during the same engaged
-    window, so ADAS sees exactly one 0x52A per OEM tick — ours."""
+    blocks OEM's bus-0 → bus-2 forwarding of 0x52A whenever openpilot has recently
+    emitted its own copy (time-gated, not controls_allowed-gated — ADAS needs the
+    spoofed settings before cruise can engage at all)."""
     ADDR = 0x52A
-    # First, round-trip through the packer to lay out every bit at OEM's values.
-    # CANPacker doesn't treat "*CheckSum" as anything special — it just packs the
-    # numeric value we give it — so we preserve OEM's CheckSum byte here and then
-    # patch it via the CRC delta once byte 4 is mutated.
+    # Round-trip through the packer to lay out every bit at OEM's values. CANPacker
+    # doesn't treat "*CheckSum" as anything special — it just packs the numeric
+    # value — so OEM's CheckSum byte lands in byte 0, which we then patch via the
+    # CRC delta once byte 4 is replaced.
     addr, data, _ = self.packer.make_can_msg("ICC_0x52A", CANBUS.pt, icc_values)
     assert addr == ADDR
 
     orig_b4 = data[4]
-    # ICCACCFuncTyp lives in bits 39..37 (top 3 bits of byte 4). Set them to 010 = 2
-    # while preserving the other 5 signals in this byte (ICCLaneTrajectorySetting,
-    # ICCACCSwt, ICCACCAutoSpdSts, ICCACCSpdStepSize).
-    new_b4 = (orig_b4 & 0x1F) | (0b010 << 5)
+    new_b4 = 0x5B
 
     if new_b4 != orig_b4:
       diff = bytearray(8)

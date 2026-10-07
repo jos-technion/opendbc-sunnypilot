@@ -96,16 +96,23 @@ def _make_fcan():
   return FiskerCAN(CP=None, packer=packer), packer
 
 
-def test_spoof_sets_funcTyp_to_2_and_routes_to_cam_bus():
+def test_spoof_byte4_is_fully_overridden_and_routes_to_cam_bus():
+  """Byte 4 overrides ALL five ACC-related fields, not just ICCACCFuncTyp:
+       ICCLaneTrajectorySetting(1) | ICCACCSwt(1) | ICCACCAutoSpdSts(1)
+       | ICCACCSpdStepSize(1) | ICCACCFuncTyp(2)
+     Nothing from OEM's byte 4 is preserved — the goal is to flip ACC on at the
+     ADAS module, which requires ICCACCSwt=1 (not just the type field)."""
   fcan, _ = _make_fcan()
   addr, data, bus = fcan.create_icc_spoof_0x52a(_icc_signal_defaults())
   assert addr == 0x52A
   assert bus == CANBUS.cam
-  # ICCACCFuncTyp lives in byte 4 bits 39..37 (top 3 bits). 2 << 5 = 0x40.
-  assert (data[4] >> 5) & 0x07 == 2
-  # All other bits in byte 4 stayed 0 (we passed 0 defaults for LaneTrajectory,
-  # Swt, AutoSpdSts, SpdStepSize).
-  assert data[4] == 0x40
+  # Expected packed byte 4:
+  #   bits 39..37 ICCACCFuncTyp           = 2 << 5 = 0x40
+  #   bit 36      ICCACCSpdStepSize       = 1 << 4 = 0x10
+  #   bit 35      ICCACCAutoSpdSts        = 1 << 3 = 0x08
+  #   bits 34..33 ICCACCSwt               = 1 << 1 = 0x02
+  #   bit 32      ICCLaneTrajectorySetting = 1    = 0x01
+  assert data[4] == 0x5B
 
 
 def test_spoof_preserves_non_byte4_signals():
@@ -127,13 +134,12 @@ def test_spoof_preserves_non_byte4_signals():
     "ICC_FCTASensitivity": 3,
     "ICC_TLRSetting": 4,
     "ICC_FCTA_Setting": 2,
-    # ICCACCFuncTyp starts as 7 to prove the spoof forces it back to 2.
+    # OEM byte-4 fields — all overridden regardless of the values here.
     "ICCACCFuncTyp": 7,
-    # Other byte-4 signals to prove they are preserved.
-    "ICCLaneTrajectorySetting": 1,
+    "ICCLaneTrajectorySetting": 0,
     "ICCACCSwt": 3,
-    "ICCACCAutoSpdSts": 1,
-    "ICCACCSpdStepSize": 1,
+    "ICCACCAutoSpdSts": 0,
+    "ICCACCSpdStepSize": 0,
   })
 
   # What the OEM would pack (no spoof) — for byte-by-byte comparison.
@@ -143,13 +149,11 @@ def test_spoof_preserves_non_byte4_signals():
   _, spoofed, spoofed_bus = fcan.create_icc_spoof_0x52a(vals)
   assert spoofed_bus == CANBUS.cam
 
-  # Only byte 0 (checksum patch) and byte 4 (FuncTyp force) should differ.
+  # Only byte 0 (checksum patch) and byte 4 (full ACC overrides) should differ.
   differing = [i for i in range(8) if spoofed[i] != oem_frame[i]]
   assert differing == [0, 4], f"unexpected byte changes: {differing}"
-
-  # Byte 4 top 3 bits are now 010 (=2). Bottom 5 bits are unchanged from OEM.
-  assert (spoofed[4] >> 5) & 0x07 == 2
-  assert (spoofed[4] & 0x1F) == (oem_frame[4] & 0x1F)
+  # Byte 4 is a constant 0x5B regardless of OEM — all five bit-fields overridden.
+  assert spoofed[4] == 0x5B
 
 
 def test_spoof_checksum_stays_valid_for_arbitrary_hypothetical_data_id():
