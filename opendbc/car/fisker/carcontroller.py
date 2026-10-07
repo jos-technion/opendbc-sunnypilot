@@ -206,8 +206,16 @@ class CarController(CarControllerBase):
       lat_ctrl_typ = 3 if (self.CP_SP.flags & FiskerFlagsSP.LAT_CTRL_LCA.value) else 1
       steer_msg = self.fcan.create_steering_control(self.apply_angle_last, self.alive_1d0)
       can_sends.append(self._stamp(steer_msg, STEER_CAN_ID, trip, reset, self.secoc_window_ctr))
+      # Also assert driver_override on the wire when the EPS tells us the driver is
+      # intervening. DBC lists ADAS_LatCtrl_DrvrOvrd as GW-only (receivers=[GW]) so the
+      # EPS is not spec'd to read it, but firmware sometimes reads what the DBC says it
+      # shouldn't — zero cost to flip the bit and see if it affects the EPS's internal
+      # counter-torque gain. If no on-vehicle difference is observed, this can be
+      # reverted to False. The Req=0 release above is the actual driver-override
+      # mechanism; this bit is just a bonus signal.
       can_sends.append(self.fcan.create_lat_control(lat_active, self.alive_1c0,
-                                                    driver_override=False, lat_ctrl_typ=lat_ctrl_typ))
+                                                    driver_override=CS.out.steeringPressed,
+                                                    lat_ctrl_typ=lat_ctrl_typ))
 
     # ---- Longitudinal (accel 0x121 + status 0x117/0x118 @ 100 Hz) ----
     # Same architecture as lateral (see comment above): send the whole triple across the
