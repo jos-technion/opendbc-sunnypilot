@@ -245,7 +245,7 @@ class FiskerCAN:
 
   # ---- ICC spoof (bus 2, replaces the OEM ICC 0x52A when engaged) ---------
 
-  def create_icc_spoof_0x52a(self, icc_values: dict):
+  def create_icc_spoof_0x52a(self, icc_values: dict, acc_auto_speed: bool = True):
     """Repack ICC_0x52A on the cam-side bus with every ACC-related setting in byte 4
     overridden so the ADAS module enters ACC mode. OEM only sets some of these to
     something other than Off, and without ICC_ACCSwt=On the ADAS module stays at
@@ -263,12 +263,16 @@ class FiskerCAN:
     Byte 4 bit layout (Motorola, MSB first, matches the DBC):
       bits 39..37 (3) ICCACCFuncTyp            = 2 (Advanced/type-2 ACC)
       bit 36      (1) ICCACCSpdStepSize        = 1 (Step_5_unit)
-      bit 35      (1) ICCACCAutoSpdSts         = 1 (On)
+      bit 35      (1) ICCACCAutoSpdSts         = acc_auto_speed (1=On, 0=Off)
       bits 34..33 (2) ICCACCSwt                = 1 (On) — ACC master switch
       bit 32      (1) ICCLaneTrajectorySetting = 1 (On)
-    All 5 bit-fields cover byte 4 completely, so byte 4 becomes a constant 0x5B
-    regardless of what OEM sent:
-      0x5B = (2 << 5) | (1 << 4) | (1 << 3) | (1 << 1) | 1
+    All 5 bit-fields cover byte 4 completely, so byte 4 is fully determined by the
+    `acc_auto_speed` arg and nothing from OEM's byte 4 is preserved.
+
+    `acc_auto_speed` corresponds to the sunnypilot FiskerACCAutoSpeed param. Default
+    True (feature on, byte 4 = 0x5B) matches the baseline on-vehicle behaviour.
+    False (byte 4 = 0x53) clears only bit 35; ACC itself still engages because
+    ICC_ACCSwt + ICCACCFuncTyp are unchanged.
 
     Bus routing: sent on CANBUS.cam (bus 2, ADAS side). Panda's fisker_fwd_hook
     blocks OEM's bus-0 → bus-2 forwarding of 0x52A whenever openpilot has recently
@@ -283,7 +287,9 @@ class FiskerCAN:
     assert addr == ADDR
 
     orig_b4 = data[4]
-    new_b4 = 0x5B
+    # 0x5B = (2 << 5) | (1 << 4) | (1 << 3) | (1 << 1) | 1 — with ICCACCAutoSpdSts On
+    # 0x53 = 0x5B & ~0x08                                 — with ICCACCAutoSpdSts Off
+    new_b4 = 0x5B if acc_auto_speed else 0x53
 
     if new_b4 != orig_b4:
       diff = bytearray(8)

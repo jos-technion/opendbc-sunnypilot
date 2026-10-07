@@ -9,6 +9,7 @@ from opendbc.car.lateral import apply_std_steer_angle_limits
 from opendbc.car.fisker.fiskercan import FiskerCAN
 from opendbc.car.fisker.secoc import stamp_secoc, sync_mac
 from opendbc.car.fisker.values import CarControllerParams
+from opendbc.sunnypilot.car.fisker.values_ext import FiskerFlagsSP
 
 
 VisualAlert = structs.CarControl.HUDControl.VisualAlert
@@ -274,7 +275,11 @@ class CarController(CarControllerBase):
     # whenever openpilot has recently emitted its own copy (time-gated, not
     # controls_allowed-gated — same reason as above).
     if CS.icc_52a_seen and CS.icc_52a_alive != self.last_spoofed_icc_alive:
-      can_sends.append(self.fcan.create_icc_spoof_0x52a(CS.icc_52a_values))
+      # Honour the sunnypilot FiskerACCAutoSpeed toggle: when the UI switch is OFF,
+      # _initialize_fisker sets FiskerFlagsSP.ACC_AUTO_SPEED_OFF so the packer drops
+      # bit 35 (ICCACCAutoSpdSts). Default (no flag set) = feature on, as shipped.
+      acc_auto_speed = not bool(self.CP_SP.flags & FiskerFlagsSP.ACC_AUTO_SPEED_OFF.value)
+      can_sends.append(self.fcan.create_icc_spoof_0x52a(CS.icc_52a_values, acc_auto_speed))
       self.last_spoofed_icc_alive = CS.icc_52a_alive
 
     # ---- HUD ----

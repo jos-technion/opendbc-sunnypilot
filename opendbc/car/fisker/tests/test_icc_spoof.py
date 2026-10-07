@@ -106,13 +106,27 @@ def test_spoof_byte4_is_fully_overridden_and_routes_to_cam_bus():
   addr, data, bus = fcan.create_icc_spoof_0x52a(_icc_signal_defaults())
   assert addr == 0x52A
   assert bus == CANBUS.cam
-  # Expected packed byte 4:
+  # Expected packed byte 4 with ICCACCAutoSpdSts=1 (default):
   #   bits 39..37 ICCACCFuncTyp           = 2 << 5 = 0x40
   #   bit 36      ICCACCSpdStepSize       = 1 << 4 = 0x10
   #   bit 35      ICCACCAutoSpdSts        = 1 << 3 = 0x08
   #   bits 34..33 ICCACCSwt               = 1 << 1 = 0x02
   #   bit 32      ICCLaneTrajectorySetting = 1    = 0x01
   assert data[4] == 0x5B
+
+
+def test_spoof_byte4_with_acc_auto_speed_off():
+  """Toggling off the sunnypilot FiskerACCAutoSpeed param drops bit 35
+  (ICCACCAutoSpdSts) only. The remaining ACC-enable bits stay 1 so ACC itself
+  still engages."""
+  fcan, _ = _make_fcan()
+  _, data, _ = fcan.create_icc_spoof_0x52a(_icc_signal_defaults(), acc_auto_speed=False)
+  # 0x5B minus bit 35 (0x08) = 0x53
+  assert data[4] == 0x53
+  # ICCACCSwt (bits 34..33) still 1 — ACC master switch untouched by the toggle.
+  assert (data[4] >> 1) & 0x3 == 1
+  # ICCACCFuncTyp (bits 39..37) still 2.
+  assert (data[4] >> 5) & 0x7 == 2
 
 
 def test_spoof_preserves_non_byte4_signals():
