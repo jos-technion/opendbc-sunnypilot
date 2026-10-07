@@ -129,6 +129,70 @@ def test_spoof_byte4_with_acc_auto_speed_off():
   assert (data[4] >> 5) & 0x7 == 2
 
 
+def test_spoof_byte6_terrain_setting_off_forces_bit_clear():
+  """terrain_setting=False forces byte-6 bit 0 to 0 (ICCACCTerrainSetting Off)
+  regardless of what OEM sent. The toggle has enable/disable semantics, not
+  passthrough — the point is to let the user override OEM's choice."""
+  fcan, _ = _make_fcan()
+  for oem_terrain in (0, 1):
+    vals = _icc_signal_defaults()
+    vals["ICCACCTerrainSetting"] = oem_terrain
+    _, data, _ = fcan.create_icc_spoof_0x52a(vals, terrain_setting=False)
+    assert data[6] & 0x01 == 0, f"with OEM terrain={oem_terrain}, got byte6=0x{data[6]:02X}"
+
+
+def test_spoof_byte6_terrain_setting_on_forces_bit():
+  """terrain_setting=True forces byte-6 bit 0 to 1 regardless of what OEM sent."""
+  fcan, _ = _make_fcan()
+  for oem_terrain in (0, 1):
+    vals = _icc_signal_defaults()
+    vals["ICCACCTerrainSetting"] = oem_terrain
+    _, data, _ = fcan.create_icc_spoof_0x52a(vals, terrain_setting=True)
+    assert data[6] & 0x01 == 1, f"with OEM terrain={oem_terrain}, got byte6=0x{data[6]:02X}"
+
+
+def test_spoof_byte6_preserves_other_fields_regardless_of_terrain():
+  """Flipping the terrain bit must NOT disturb TiGapCfm/ISASetting/reserved."""
+  fcan, _ = _make_fcan()
+  vals = _icc_signal_defaults()
+  vals.update({
+    "ICCACCTerrainSetting": 0,       # OEM says Off; we'll force On
+    "ICCACCTiGapCfm": 2,             # bits 51..50
+    "ICCISASetting": 5,              # bits 54..52
+    "ICC_0x52A_Rsv49": 1,
+    "ICC_0x52A_Rsv55": 1,
+  })
+  _, data, _ = fcan.create_icc_spoof_0x52a(vals, terrain_setting=True)
+  # byte 6 top 7 bits should match what the OEM pack would have produced.
+  _, oem, _ = _make_fcan()[1].make_can_msg("ICC_0x52A", CANBUS.pt, vals)
+  assert data[6] & 0xFE == oem[6] & 0xFE
+  assert data[6] & 0x01 == 1
+
+
+def test_spoof_two_byte_overrides_fix_checksum_once():
+  """When both byte 4 and byte 6 differ, the XOR delta must account for both so
+  the resulting checksum is still valid under any hypothetical DataID."""
+  fcan, packer = _make_fcan()
+  vals = _icc_signal_defaults()
+  vals.update({
+    "ICCACCFuncTyp": 7,            # byte 4 differs from 0x5B / 0x53
+    "ICCACCTerrainSetting": 0,     # byte 6 bit 0 differs if we flip it on
+    "ICCISASetting": 4,            # extra byte-6 content to prove it's preserved
+  })
+  for hypothetical_data_id in (0x00, 0x7F, 0xF5, 0xFF):
+    vals["ICC_0x52ACheckSum"] = 0
+    _, zeroed, _ = packer.make_can_msg("ICC_0x52A", CANBUS.pt, vals)
+    valid_chk = _crc8_j1850(bytes([hypothetical_data_id]) + zeroed[1:])
+    vals["ICC_0x52ACheckSum"] = valid_chk
+
+    _, spoofed, _ = fcan.create_icc_spoof_0x52a(vals, acc_auto_speed=False, terrain_setting=True)
+    scratch = _crc8_j1850(bytes([hypothetical_data_id]) + spoofed[1:])
+    assert spoofed[0] == scratch, (
+      f"two-byte checksum invalid under data_id={hypothetical_data_id:02X}: "
+      f"got {spoofed[0]:02X}, expected {scratch:02X}"
+    )
+
+
 def test_spoof_preserves_non_byte4_signals():
   fcan, packer = _make_fcan()
   # Choose distinct non-zero values across many signals so we can see them survive.
@@ -159,8 +223,9 @@ def test_spoof_preserves_non_byte4_signals():
   # What the OEM would pack (no spoof) — for byte-by-byte comparison.
   _, oem_frame, _ = packer.make_can_msg("ICC_0x52A", CANBUS.pt, vals)
 
-  # And the spoofed version.
-  _, spoofed, spoofed_bus = fcan.create_icc_spoof_0x52a(vals)
+  # Spoof call matches OEM's byte-6 bit 0 (both terrain-on) so passthrough is clean;
+  # the test's job is only to prove byte 4 overrides don't disturb anything else.
+  _, spoofed, spoofed_bus = fcan.create_icc_spoof_0x52a(vals, terrain_setting=True)
   assert spoofed_bus == CANBUS.cam
 
   # Only byte 0 (checksum patch) and byte 4 (full ACC overrides) should differ.

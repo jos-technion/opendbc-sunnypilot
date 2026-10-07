@@ -199,9 +199,14 @@ class CarController(CarControllerBase):
       # further change is applied this tick, so our first TX carries msg_counter
       # matching OEM_current exactly. From next tick on, the free-running increment
       # carries it forward in lockstep with OEM.
+      # Lateral control type: sunnypilot FiskerLateralType toggle. Flag set = LCA/TJA
+      # (Typ=3), flag clear = LKA (Typ=1, baseline). The Ocean's EPS has historically
+      # only honoured LKA, so defaulting to 1 keeps the port working.
+      lat_ctrl_typ = 3 if (self.CP_SP.flags & FiskerFlagsSP.LAT_CTRL_LCA.value) else 1
       steer_msg = self.fcan.create_steering_control(self.apply_angle_last, self.alive_1d0)
       can_sends.append(self._stamp(steer_msg, STEER_CAN_ID, trip, reset, self.secoc_window_ctr))
-      can_sends.append(self.fcan.create_lat_control(lat_active, self.alive_1c0, driver_override=False))
+      can_sends.append(self.fcan.create_lat_control(lat_active, self.alive_1c0,
+                                                    driver_override=False, lat_ctrl_typ=lat_ctrl_typ))
 
     # ---- Longitudinal (accel 0x121 + status 0x117/0x118 @ 100 Hz) ----
     # Same architecture as lateral (see comment above): send the whole triple across the
@@ -275,11 +280,15 @@ class CarController(CarControllerBase):
     # whenever openpilot has recently emitted its own copy (time-gated, not
     # controls_allowed-gated — same reason as above).
     if CS.icc_52a_seen and CS.icc_52a_alive != self.last_spoofed_icc_alive:
-      # Honour the sunnypilot FiskerACCAutoSpeed toggle: when the UI switch is OFF,
-      # _initialize_fisker sets FiskerFlagsSP.ACC_AUTO_SPEED_OFF so the packer drops
-      # bit 35 (ICCACCAutoSpdSts). Default (no flag set) = feature on, as shipped.
+      # Honour the sunnypilot UI toggles:
+      #   FiskerACCAutoSpeed → ACC_AUTO_SPEED_OFF flag → clears byte-4 bit 35
+      #   FiskerACCTerrain   → ACC_TERRAIN_ON flag    → sets byte-6 bit 0
+      # Flags are stored in whichever polarity makes "no flag" = baseline behaviour.
       acc_auto_speed = not bool(self.CP_SP.flags & FiskerFlagsSP.ACC_AUTO_SPEED_OFF.value)
-      can_sends.append(self.fcan.create_icc_spoof_0x52a(CS.icc_52a_values, acc_auto_speed))
+      terrain_setting = bool(self.CP_SP.flags & FiskerFlagsSP.ACC_TERRAIN_ON.value)
+      can_sends.append(self.fcan.create_icc_spoof_0x52a(CS.icc_52a_values,
+                                                        acc_auto_speed=acc_auto_speed,
+                                                        terrain_setting=terrain_setting))
       self.last_spoofed_icc_alive = CS.icc_52a_alive
 
     # ---- HUD ----

@@ -102,31 +102,41 @@ class FiskerCAN:
     chk = fisker_plain_checksum(addr, data)
     return addr, bytes([chk]) + data[1:], bus
 
-  def create_lat_control(self, lat_active: bool, counter: int, driver_override: bool = False):
+  def create_lat_control(self, lat_active: bool, counter: int, driver_override: bool = False,
+                         lat_ctrl_typ: int = 1):
     """ADAS_0x1C0 — lateral-control activation/status, 10 ms cycle (plain E2E checksum,
     no SecOC).
 
     Sent for the full engaged window (not only while lat_active) so the cluster never sees
     the frame disappear. The content mirrors the OEM's semantics:
-      * lat_active True  -> Sts=1, Req=1, Typ=1 (active, requesting the 0x1D0 angle)
+      * lat_active True  -> Sts=1, Req=1, Typ=lat_ctrl_typ (active, requesting the 0x1D0 angle)
       * lat_active False -> Sts=0, Req=0, Typ=0 (inactive, i.e. the OEM's default frame)
     This way, when the driver overrides and lat_active drops, the EPS gets a fresh Req=0
     on the very next 10 ms cycle and releases -- unlike the previous design that stopped
     sending 0x1C0 altogether, which left the EPS servoing the last commanded angle for a
     beat and made the wheel very hard to move.
 
+    ADAS_LatCtrl_Typ selects the lateral-control type the EPS runs. DBC values:
+      1=LKA_angle_request (default — the Ocean's EPS historically only honours this)
+      2=ELKA_angle_request
+      3=LCA_or_TJA_angle_request (sunnypilot FiskerLateralType toggle = LCA/TJA)
+      4..7 other modes we don't support
+    The sunnypilot UI exposes a toggle for 1 vs 3; other values aren't reachable from
+    carcontroller. If 3 fails on-vehicle (EPS rejects the Typ), flipping back to the
+    default toggle setting restores LKA without a code change.
+
     ADAS_LatCtrl_DrvrOvrd is a diagnostic bit the ADAS sends to the Gateway only (DBC
     receiver list = GW). The EPS does NOT read it; it uses its own driver-torque sensor
     (EPS_DrvrSteerTq/EPS_DrvrIntvSteerWhlDetd on 0x1C4). Setting DrvrOvrd here is purely
     informational for the GW log."""
     values = {
-      "ADAS_LatCtrl_Sts": 1 if lat_active else 0,        # 0=Inactive 1=Active
-      "ADAS_LatCtrl_StsVld": 1,                           # 1=Valid
-      "ADAS_LatCtrl_DrvrOvrd": 1 if driver_override else 0,  # GW-only diagnostic
-      "ADAS_LatCtrl_DrvrOvrdVld": 1,                      # 1=Valid
-      "ADAS_LatCtrl_Typ": 1 if lat_active else 0,         # 1=LKA_angle_request 0=Not_active
-      "ADAS_LatCtrl_ReqVld": 1 if lat_active else 0,      # 1=Steering_angle_request_valid
-      "ADAS_LatCtrl_Req": 1 if lat_active else 0,         # 1=Angle_request_active -> EPS servoes
+      "ADAS_LatCtrl_Sts": 1 if lat_active else 0,              # 0=Inactive 1=Active
+      "ADAS_LatCtrl_StsVld": 1,                                 # 1=Valid
+      "ADAS_LatCtrl_DrvrOvrd": 1 if driver_override else 0,     # GW-only diagnostic
+      "ADAS_LatCtrl_DrvrOvrdVld": 1,                            # 1=Valid
+      "ADAS_LatCtrl_Typ": lat_ctrl_typ if lat_active else 0,    # 1=LKA, 3=LCA_or_TJA, 0=Not_active
+      "ADAS_LatCtrl_ReqVld": 1 if lat_active else 0,            # 1=Steering_angle_request_valid
+      "ADAS_LatCtrl_Req": 1 if lat_active else 0,               # 1=Angle_request_active -> EPS servoes
       "ADAS_1C0_AliveCounter": counter & 0xF,
       "ADAS_1C0_CheckSum": 0,   # filled below
     }
@@ -245,7 +255,8 @@ class FiskerCAN:
 
   # ---- ICC spoof (bus 2, replaces the OEM ICC 0x52A when engaged) ---------
 
-  def create_icc_spoof_0x52a(self, icc_values: dict, acc_auto_speed: bool = True):
+  def create_icc_spoof_0x52a(self, icc_values: dict, acc_auto_speed: bool = True,
+                             terrain_setting: bool = False):
     """Repack ICC_0x52A on the cam-side bus with every ACC-related setting in byte 4
     overridden so the ADAS module enters ACC mode. OEM only sets some of these to
     something other than Off, and without ICC_ACCSwt=On the ADAS module stays at
@@ -253,26 +264,31 @@ class FiskerCAN:
     enables ACC via the ICC spoof path.
 
     `icc_values` is a snapshot of every ICC_0x52A signal (see
-    fisker.carstate.ICC_0x52A_SIGNALS) captured on bus 0. Every field outside byte 4
-    — including the OEM CheckSum, AliveCounter, and reserved bits — is passed
-    through untouched, so the spoofed frame is byte-identical to what ICC just sent
-    except for byte 4 and the one-byte CheckSum fix-up. The CheckSum is adjusted via
-    a CRC-8 XOR delta (see fisker_icc_checksum_delta) so we don't need to know
-    0x52A's per-message DataID.
+    fisker.carstate.ICC_0x52A_SIGNALS) captured on bus 0. Every field outside the
+    two overridden bytes — including the OEM CheckSum, AliveCounter, and reserved
+    bits — is passed through untouched, so the spoofed frame is byte-identical to
+    what ICC just sent except for bytes 4 and 6, plus the one-byte CheckSum fix-up.
+    The CheckSum is adjusted via a CRC-8 XOR delta (see fisker_icc_checksum_delta)
+    so we don't need to know 0x52A's per-message DataID.
 
-    Byte 4 bit layout (Motorola, MSB first, matches the DBC):
+    Byte 4 bit layout (Motorola, MSB first, matches the DBC) — ALL overridden:
       bits 39..37 (3) ICCACCFuncTyp            = 2 (Advanced/type-2 ACC)
       bit 36      (1) ICCACCSpdStepSize        = 1 (Step_5_unit)
       bit 35      (1) ICCACCAutoSpdSts         = acc_auto_speed (1=On, 0=Off)
       bits 34..33 (2) ICCACCSwt                = 1 (On) — ACC master switch
       bit 32      (1) ICCLaneTrajectorySetting = 1 (On)
     All 5 bit-fields cover byte 4 completely, so byte 4 is fully determined by the
-    `acc_auto_speed` arg and nothing from OEM's byte 4 is preserved.
+    `acc_auto_speed` arg; nothing from OEM's byte 4 is preserved:
+      0x5B (acc_auto_speed=True)  = all five set to the "on" values above
+      0x53 (acc_auto_speed=False) = 0x5B & ~0x08 (bit 35 cleared)
 
-    `acc_auto_speed` corresponds to the sunnypilot FiskerACCAutoSpeed param. Default
-    True (feature on, byte 4 = 0x5B) matches the baseline on-vehicle behaviour.
-    False (byte 4 = 0x53) clears only bit 35; ACC itself still engages because
-    ICC_ACCSwt + ICCACCFuncTyp are unchanged.
+    Byte 6 bit 0 only (ICCACCTerrainSetting, 1-bit @ start 48, Motorola so LSB of
+    byte 6) is overridden by the `terrain_setting` arg. The remaining byte-6 bits
+    (ICC_0x52A_Rsv49, ICCACCTiGapCfm, ICCISASetting, ICC_0x52A_Rsv55) pass through
+    from OEM — only the terrain bit is flipped.
+
+    `acc_auto_speed`  ← FiskerACCAutoSpeed param (default On;  byte 4 = 0x5B)
+    `terrain_setting` ← FiskerACCTerrain  param (default Off; byte 6 bit 0 cleared)
 
     Bus routing: sent on CANBUS.cam (bus 2, ADAS side). Panda's fisker_fwd_hook
     blocks OEM's bus-0 → bus-2 forwarding of 0x52A whenever openpilot has recently
@@ -282,22 +298,27 @@ class FiskerCAN:
     # Round-trip through the packer to lay out every bit at OEM's values. CANPacker
     # doesn't treat "*CheckSum" as anything special — it just packs the numeric
     # value — so OEM's CheckSum byte lands in byte 0, which we then patch via the
-    # CRC delta once byte 4 is replaced.
+    # CRC delta once the override bytes are replaced.
     addr, data, _ = self.packer.make_can_msg("ICC_0x52A", CANBUS.pt, icc_values)
     assert addr == ADDR
 
     orig_b4 = data[4]
-    # 0x5B = (2 << 5) | (1 << 4) | (1 << 3) | (1 << 1) | 1 — with ICCACCAutoSpdSts On
-    # 0x53 = 0x5B & ~0x08                                 — with ICCACCAutoSpdSts Off
+    orig_b6 = data[6]
     new_b4 = 0x5B if acc_auto_speed else 0x53
+    # Byte 6: preserve bits 1..7 (TiGapCfm, ISASetting, reserved), set bit 0.
+    new_b6 = (orig_b6 & 0xFE) | (0x01 if terrain_setting else 0x00)
 
+    diff = bytearray(8)
     if new_b4 != orig_b4:
-      diff = bytearray(8)
       diff[4] = orig_b4 ^ new_b4
+    if new_b6 != orig_b6:
+      diff[6] = orig_b6 ^ new_b6
+    if any(diff):
       delta_chk = fisker_icc_checksum_delta(bytes(diff))
       out = bytearray(data)
       out[0] ^= delta_chk
       out[4] = new_b4
+      out[6] = new_b6
       data = bytes(out)
 
     return ADDR, data, CANBUS.cam

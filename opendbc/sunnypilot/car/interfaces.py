@@ -156,14 +156,28 @@ def _initialize_stop_and_go(CP: structs.CarParams, CP_SP: structs.CarParamsSP, p
 
 
 def _initialize_fisker(CP: structs.CarParams, CP_SP: structs.CarParamsSP, params_dict: dict[str, str]) -> None:
-  # Fisker Ocean: the ICC_0x52A spoof forces ICCACCAutoSpdSts=1 by default. Flip
-  # the flag only when the user has explicitly turned the UI toggle OFF, so new
-  # installs (no param present yet) get the baseline on-vehicle behaviour. The
-  # fiskercan packer reads the flag and recomputes byte 4 accordingly.
+  # Fisker Ocean: three sunnypilot UI toggles plumb through to CP_SP flags so the
+  # fiskercan packers / lat_control builder can read them per-tick. Each flag is
+  # stored in whichever polarity makes "no param present" == baseline on-vehicle
+  # behaviour (see FiskerFlagsSP for the mapping).
   if CP.brand == 'fisker':
-    acc_auto_speed = int(params_dict.get("FiskerACCAutoSpeed", 1)) == 1
-    if not acc_auto_speed:
+    # FiskerACCAutoSpeed: default '1' (on). Flag ACC_AUTO_SPEED_OFF set only when
+    # the user has explicitly turned the UI toggle OFF.
+    if int(params_dict.get("FiskerACCAutoSpeed", 1)) != 1:
       CP_SP.flags |= FiskerFlagsSP.ACC_AUTO_SPEED_OFF.value
+
+    # FiskerACCTerrain: default '0' (off). Flag ACC_TERRAIN_ON set only when the
+    # user has explicitly turned the UI toggle ON — Terrain mode is off at
+    # baseline, so the spoof passes OEM's byte-6 bit 0 through unchanged in the
+    # default case.
+    if int(params_dict.get("FiskerACCTerrain", 0)) == 1:
+      CP_SP.flags |= FiskerFlagsSP.ACC_TERRAIN_ON.value
+
+    # FiskerLateralType: default '0' (LKA, Typ=1). Flag LAT_CTRL_LCA set only
+    # when the user has explicitly selected LCA/TJA (Typ=3). The Ocean's EPS
+    # historically only honoured LKA so this is an experimental switch.
+    if int(params_dict.get("FiskerLateralType", 0)) == 1:
+      CP_SP.flags |= FiskerFlagsSP.LAT_CTRL_LCA.value
 
 
 def _initialize_toyota(CP: structs.CarParams, CP_SP: structs.CarParamsSP, params_dict: dict[str, str]) -> None:
