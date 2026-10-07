@@ -126,18 +126,19 @@ class CarController(CarControllerBase):
     # (e.g. MADS engaged without cruise), the EPS receives NEITHER openpilot's frames
     # nor the OEM's (panda blocks the OEM's) → LKA fault + wheel doesn't move.
     #
-    # DISABLED: driver-torque override (release EPS on steeringPressed). The Ocean's
-    # EPS_DrvrSteerTq reads torque on the whole steering column — including reaction
-    # torque from the ADAS assist itself while it's actively steering. That meant
-    # `steeringPressed` fired even when the driver wasn't touching the wheel, dropping
-    # Req=0 and cancelling engagement. Until we can decouple driver torque from motor
-    # reaction (either a smarter threshold, a longer debounce, or a different sensor
-    # input), just gate Req on CC.latActive directly and let openpilot's stock nudge
-    # behaviour handle overrides. `driver_override` on 0x1C0 is Gateway-only (EPS doesn't
-    # read it) so we send False to keep the wire quiet.
-    lat_active = CC.latActive and secoc_ok
+    # Driver-torque override (release EPS on steeringPressed). CS.out.steeringPressed
+    # is now driven by the EPS's dedicated EPS_DrvrIntvSteerWhlDetd bit (0x1C4), which
+    # excludes motor reaction torque, so unlike the previous attempt it only trips on
+    # real driver input. When the driver is intervening we drop lat_active so
+    # ADAS_LatCtrl_Req goes to 0 and the EPS stops servoing against the wheel — this
+    # is what lets the driver co-steer. steeringAngleDeg continues to update though
+    # (we mirror the measured angle while inactive so there's no step change when the
+    # user releases and lat_active snaps back to True), and the whole engaged envelope
+    # stays open so the EPS doesn't fault on a disappearing 0x1C0. `driver_override`
+    # on the wire is still 0 — it's a GW-only diagnostic, EPS doesn't read it.
     mads_engaged = bool(CC_SP.mads.enabled) if CC_SP is not None else False
     engaged = (CS.out.cruiseState.enabled or mads_engaged) and secoc_ok
+    lat_active = CC.latActive and secoc_ok and not CS.out.steeringPressed
     self.apply_angle_last = apply_std_steer_angle_limits(
       actuators.steeringAngleDeg, self.apply_angle_last, CS.out.vEgoRaw,
       CS.out.steeringAngleDeg, lat_active, self.params.ANGLE_LIMITS,

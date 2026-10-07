@@ -115,6 +115,13 @@ class CarState(CarStateBase):
     self.icc_52a_alive = -1     # sentinel; -1 means "no ICC frame seen yet"
     self.icc_52a_seen = False
 
+    # EPS lateral state cache + fault latches (see update()). Default to Off / No_Abort
+    # so a startup race (CS consumed before first 0x1C2) reads as "EPS not yet in
+    # control" instead of a false "Active".
+    self.eps_lat_sts = 0             # 0=Off, 1=Available_For_Control, 2=Active, 3=Failure
+    self.eps_abort = 0               # EPS_AbortFb enum
+    self.eps_sts_ever_valid = False  # latches once EPS_AdasLatCtrlStsVld == 1
+
     # Button state edge detection
     self._prev_button_state = {sig: 0 for sig in BUTTON_SIGNAL_TO_TYPE}
 
@@ -156,10 +163,53 @@ class CarState(CarStateBase):
     # rate from numerical diff is handled by selfdrived; provide raw signal if available
 
     drvr_tq_dir = eps_tq["EPS_DrvrSteerTqDir"]   # 0=CCW (positive), 1=CW (negative)
-    drvr_tq_mag = eps_tq["EPS_DrvrSteerTq"]      # 0..8 Nm
+    drvr_tq_mag = eps_tq["EPS_DrvrSteerTq"]      # 0..8 Nm (column torque — INCLUDES motor reaction)
     ret.steeringTorque = drvr_tq_mag * (-1.0 if int(drvr_tq_dir) == 1 else 1.0)
     ret.steeringTorqueEps = eps_ang["EPS_AsscMotCrtTq"]
-    ret.steeringPressed = self.update_steering_pressed(abs(ret.steeringTorque) > STEER_THRESHOLD, 5)
+
+    # Driver intervention: prefer EPS's dedicated bit (EPS_DrvrIntvSteerWhlDetd on
+    # 0x1C4) over a column-torque threshold. EPS_DrvrSteerTq reports torque on the
+    # whole steering column — INCLUDING the servo motor's own reaction torque while
+    # LKA/TJA is active — so a threshold on it false-fires during normal engagement
+    # and silently drops Req=0, cancelling steering. The dedicated bit is computed
+    # by the EPS with internal knowledge of its own motor contribution, so it only
+    # trips on real driver input. Fall back to the torque threshold if the EPS
+    # reports the intervention bit as Initializing/Invalid (StsVld != Valid).
+    drvr_intv_vld = int(eps_tq["EPS_DrvrIntvSteerWhlVld"]) == 1
+    drvr_intv = int(eps_tq["EPS_DrvrIntvSteerWhlDetd"]) == 1
+    if drvr_intv_vld:
+      ret.steeringPressed = self.update_steering_pressed(drvr_intv, 5)
+    else:
+      ret.steeringPressed = self.update_steering_pressed(abs(ret.steeringTorque) > STEER_THRESHOLD, 5)
+
+    # EPS lateral control state (EPS_AdasLatCtrlSts on 0x1C2):
+    #   0=Off, 1=Available_For_Control, 2=Active, 3=Failure
+    # When we're commanding steering and the EPS reports anything other than Active or
+    # Available (e.g. Failure, or Off while we expect Active), the control loop has
+    # unlatched at the EPS end — openpilot previously had no visibility into this and
+    # kept TXing angle requests into the void with sunnypilot's UI claiming lateral was
+    # engaged. Surface it as steerFaultTemporary so selfdrived mutes the request and
+    # the UI shows "Lateral Fault". Clears automatically when the EPS returns to
+    # Available/Active.
+    #
+    # EPS_AbortFb enum (0x1C2):
+    #   0=No_Abort, 1=Driver_Interference_StrWhl, 6=EPS_Internal_Failure,
+    #   7=Vehicle_Speed_Exceeds_Limits, 8=CAN_communication_issue, 9=Other_Abort_Reasons
+    # Driver interference (1) is EXPECTED during co-steering and intentionally does NOT
+    # raise a fault — carcontroller already drops Req=0 on steeringPressed to release
+    # the EPS. Any other non-zero AbortFb is a real abort worth surfacing.
+    eps_lat_sts = int(eps_ang["EPS_AdasLatCtrlSts"])
+    eps_lat_sts_vld = int(eps_ang["EPS_AdasLatCtrlStsVld"]) == 1
+    eps_abort = int(eps_ang["EPS_AbortFb"])
+    # Latch once we've seen the EPS report Valid at least once — avoids faulting
+    # during boot while the signal is still Initializing. Reset at ignition cycle.
+    self.eps_sts_ever_valid = self.eps_sts_ever_valid or eps_lat_sts_vld
+    ret.steerFaultTemporary = self.eps_sts_ever_valid and (
+      eps_lat_sts == 3 or (eps_abort not in (0, 1))
+    )
+    # Stash the raw EPS state for carcontroller / diagnostics.
+    self.eps_lat_sts = eps_lat_sts
+    self.eps_abort = eps_abort
 
     # ---- Pedals ----
     # VCU_0x214 is the gateway-mirrored VCU status on ADASBUS (SecOC-protected,
