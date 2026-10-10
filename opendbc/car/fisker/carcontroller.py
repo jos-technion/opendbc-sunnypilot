@@ -144,9 +144,19 @@ class CarController(CarControllerBase):
     # (which also killed sunnypilot's auto-lane-change nudge detection since ALC
     # watches steeringPressed too). Separating the two sensitivities lets light
     # nudges feed ALC while hard overpower releases the EPS.
-    mads_engaged = bool(CC_SP.mads.enabled) if CC_SP is not None else False
-    engaged = (CS.out.cruiseState.enabled or mads_engaged) and secoc_ok
-    lat_engaged = mads_engaged and secoc_ok
+    # Use mads.active (= state ∈ {enabled, softDisabling, overriding}) rather than
+    # mads.enabled, which also returns True for State.paused. MADS can enter paused
+    # directly from disabled (gear/door/seatbelt NO_ENTRY condition + silent LKAS
+    # disable), which has no engagement event — so keying off `enabled` makes
+    # lat_engaged latch True indefinitely from startup and we TX zeros at 100 Hz
+    # even in pure ACC-only. The EPS then sees our Sts=0 stream racing OEM's own
+    # lateral once ACC becomes Active and raises abort=8 (CAN).
+    #
+    # mads.active only lights up when MADS is actually commanding steering, which
+    # is the only time we have any business TXing on 0x1D0/0x1C0.
+    mads_active = bool(CC_SP.mads.active) if CC_SP is not None else False
+    engaged = (CS.out.cruiseState.enabled or mads_active) and secoc_ok
+    lat_engaged = mads_active and secoc_ok
     lat_active = CC.latActive and secoc_ok and not CS.driver_intervening
     self.apply_angle_last = apply_std_steer_angle_limits(
       actuators.steeringAngleDeg, self.apply_angle_last, CS.out.vEgoRaw,
