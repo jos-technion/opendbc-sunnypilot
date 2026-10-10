@@ -204,22 +204,28 @@ class CarController(CarControllerBase):
     # ahead of OEM — if we did and MADS later rose, our first TX would be out-of-sync
     # with OEM's current value by however many ticks the ACC-only window lasted.
     if lat_engaged and not self.was_lat_engaged_prev:
-      # Rising edge: seed our alive to (OEM_current - 1) so that AFTER the standard
-      # per-tick increment below, our first-TX alive equals OEM_current — matching the
-      # value OEM's blocked frame would have carried. This is the "we ARE OEM" model:
-      # our stream literally continues OEM's numbering during the blocked window.
+      # Rising edge: seed our alive counter so that AFTER the standard per-tick
+      # increment below, our first-TX alive = (OEM_last + 1) — i.e. the NEXT value
+      # OEM would have sent, which is what the EPS is expecting next. CS.oem_1d0_alive
+      # is the LAST observed OEM counter; EPS has already processed it, so sending the
+      # same value is a duplicate and gets rejected (abort=8 CAN on 0x1C2, seen in the
+      # on-vehicle trace at 8.375s = 30 ms after our first Req=1 frame hit the EPS).
       #
-      # At disengage, our last alive was OEM_current+N. OEM has been ticking at 100 Hz
-      # in lockstep with our carcontroller (also 100 Hz), so OEM's counter is also at
-      # OEM_current+N when we stop. Panda unblocks; OEM's next tick lands on bus 0 at
-      # OEM_current+N+1 — which is exactly our_last + 1, i.e. what EPS expects next.
-      # Clean handoff both directions, no +1 jump at engage, no duplicate at disengage.
-      self.alive_1d0 = (int(CS.oem_1d0_alive) - 1) % 15
-      self.alive_1c0 = (int(CS.oem_1c0_alive) - 1) % 15
-      # SecOC msg counter: snap low 6 bits to OEM_wire. The free-running
-      # secoc_window_ctr already got its +1 earlier in this update and won't increment
-      # again this tick, so our first TX carries msg_counter matching OEM_current exactly.
-      self.secoc_window_ctr = (self.secoc_window_ctr & ~0x3F) | (int(CS.oem_1d0_secoc_wire_ctr) & 0x3F)
+      # Seed to OEM_last so (+1 per-tick) gives first-TX = OEM_last + 1 = EPS-expected.
+      #
+      # Disengage math still clean: after N ticks our last-sent = OEM_last+N, OEM's own
+      # counter has also advanced to OEM_last+N (both 100 Hz lockstep), OEM's next TX =
+      # OEM_last+N+1 = exactly our_last+1 that EPS is now expecting. No duplicate, no
+      # jump, no fault on either edge.
+      self.alive_1d0 = int(CS.oem_1d0_alive) % 15
+      self.alive_1c0 = int(CS.oem_1c0_alive) % 15
+      # SecOC msg counter: same +1 fix for the wire counter. Snap low 6 bits to
+      # (OEM_wire + 1) % 64 so our first TX carries msg_counter = OEM_wire+1 (next
+      # expected). secoc_window_ctr already got its per-tick increment earlier in
+      # this update and won't change again this tick, so the snap IS the first-TX
+      # value for the low bits. High bits stay from the free-running counter, which
+      # has been counting from GW Reset in lockstep with OEM so they already match.
+      self.secoc_window_ctr = (self.secoc_window_ctr & ~0x3F) | ((int(CS.oem_1d0_secoc_wire_ctr) + 1) & 0x3F)
     # Fade-out window: on lat_engaged falling edge we extend the TX window by FADE_TICKS
     # so the EPS keeps receiving our Req=0 stream for a beat after disengage. During
     # fade: panda's time-based lateral relay keeps blocking OEM 0x1D0/0x1C0, the EPS
