@@ -39,6 +39,16 @@ _BUTTON_TYPE = {
 }
 BUTTON_SIGNAL_TO_TYPE = {sig: _BUTTON_TYPE[name] for sig, name in BUTTON_MAP.items()}
 
+# Per-signal predicates for "is this press active" on each MFS button. MFS_0x514 buttons
+# are 2-bit (0=No_Pressed, 1=Pressed, 2=Long_Press, 3=Reserved). The car side already
+# consumes short-press of MFS_RiBtnSouth for the ACC follow-distance adjustment, so to
+# avoid stepping on it we only treat the long-press (value 2) as the MADS trigger.
+# Everything else keeps the "any non-zero" meaning.
+def _is_pressed(sig: str, cur: int) -> bool:
+  if sig == "MFS_RiBtnSouth":
+    return cur == 2
+  return cur != 0
+
 
 # Every signal in ICC_0x52A. Enumerated once here so carstate snapshots the whole frame
 # and the carcontroller can round-trip it into the spoofed packet with only
@@ -127,8 +137,40 @@ class CarState(CarStateBase):
     # conservative (real overpower) for the EPS release in carcontroller. See update().
     self.driver_intervening = False
 
+    # Per-button MADS arming. Both MFS_RiBtnNorth and MFS_RiBtnEast engage the car's ACC
+    # on the vehicle side; this port differentiates them on whether sunnypilot MADS auto-
+    # engages lateral alongside. Starts False (ACC-only) each boot — the FiskerMadsArmed
+    # param is CLEAR_ON_MANAGER_START so it also comes back False after manager restart.
+    # Params is imported lazily (openpilot.common.params requires libparams_c, which isn't
+    # built in a plain opendbc test env on macOS); the first time we need to write the
+    # sidechannel we construct it, and if even that fails (test harness) we swallow the
+    # error so test_car_interfaces still passes.
+    self._mads_arm_from_east = False
+    self._params = None               # lazily constructed on first write
+    self._prev_cc_state = 0           # tracks ADAS_Sts_ACC_ICC for cruise→Off reset edge
+
     # Button state edge detection
     self._prev_button_state = {sig: 0 for sig in BUTTON_SIGNAL_TO_TYPE}
+
+  def _set_mads_arm(self, armed: bool) -> None:
+    """Update the MADS-arm state + its Params sidechannel to sunnypilot MADS.
+
+    Params is imported lazily: the opendbc test harness on macOS doesn't have
+    libparams_c built, so instantiating Params at import or __init__ time crashes
+    test_car_interfaces. On-device the import succeeds; in tests the ImportError
+    is swallowed and the in-memory state still updates (which is all the tests
+    see). put_bool failures are swallowed for the same reason."""
+    self._mads_arm_from_east = armed
+    if self._params is None:
+      try:
+        from openpilot.common.params import Params
+        self._params = Params()
+      except Exception:  # noqa: BLE001 - any failure (ImportError, OSError) means "no params available"
+        return
+    try:
+      self._params.put_bool("FiskerMadsArmed", armed)
+    except Exception:  # noqa: BLE001
+      pass
 
   def update(self, can_parsers) -> tuple[structs.CarState, structs.CarStateSP]:
     cp_pt = can_parsers[Bus.pt]
@@ -307,20 +349,42 @@ class CarState(CarStateBase):
     ret.cruiseState.speedCluster = cc_speed
 
     # ---- Buttons (MFSS) ----
+    # Edge-detect per signal with a signal-specific "is pressed" predicate so that e.g.
+    # MFS_RiBtnSouth short press (used by the car for the ACC follow-distance adjustment)
+    # doesn't trigger a MADS button event — only its long press does. See _is_pressed.
+    #
+    # In the same loop we also update the per-button MADS-arm flag:
+    #   * RiBtnEast rising → arm (ACC + MADS when cruise engages)
+    #   * RiBtnNorth rising → disarm (ACC only, no MADS)
+    # The resulting state is written to the FiskerMadsArmed param so sunnypilot MADS
+    # (openpilot/sunnypilot/mads/mads.py:block_unified_engagement_mode) can read it.
+    # Writes are gated on actual value changes to keep disk I/O at a handful per drive.
     mfs = cp_pt.vl["MFS_0x514"]
     button_events = []
     for sig, btype in BUTTON_SIGNAL_TO_TYPE.items():
       cur = int(mfs[sig])
       prev = self._prev_button_state[sig]
-      # treat any non-zero state as "pressed" for the first frame of the press
-      if cur != 0 and prev == 0:
-        be = structs.CarState.ButtonEvent(pressed=True, type=btype)
-        button_events.append(be)
-      elif cur == 0 and prev != 0:
-        be = structs.CarState.ButtonEvent(pressed=False, type=btype)
-        button_events.append(be)
+      pressed_now = _is_pressed(sig, cur)
+      pressed_prev = _is_pressed(sig, prev)
+      rising = pressed_now and not pressed_prev
+      if rising:
+        button_events.append(structs.CarState.ButtonEvent(pressed=True, type=btype))
+        if sig == "MFS_RiBtnEast" and not self._mads_arm_from_east:
+          self._set_mads_arm(True)
+        elif sig == "MFS_RiBtnNorth" and self._mads_arm_from_east:
+          self._set_mads_arm(False)
+      elif not pressed_now and pressed_prev:
+        button_events.append(structs.CarState.ButtonEvent(pressed=False, type=btype))
       self._prev_button_state[sig] = cur
     ret.buttonEvents = button_events
+
+    # Reset MADS arming when ACC transitions to Off (state 0). Guarantees each cruise
+    # session begins in the safer "ACC-only until the user explicitly presses East"
+    # state. Watching the edge (prev != 0 → cur == 0) rather than steady-state so we
+    # don't re-write the param every tick while ACC is off.
+    if cc_state == 0 and self._prev_cc_state != 0 and self._mads_arm_from_east:
+      self._set_mads_arm(False)
+    self._prev_cc_state = cc_state
 
     # ---- Faults ----
     # ADAS_Sts_ACC_ICC 9/10 = Failure_reversible/irreversible (same enum position as

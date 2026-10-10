@@ -77,13 +77,15 @@ static void fisker_rx_hook(const CANPacket_t *msg) {
     }
 
     // MFS_0x514: MFSS steering-wheel buttons. MFS_RiBtnSouth (2-bit @ start 33, big-endian
-    // -> byte 4 bits 0,1) is sunnypilot's MADS engage/disengage toggle. Any non-zero state
-    // counts as pressed (1=short_press, 2=long_press, 3=reserved). Openpilot's carstate
-    // emits a matching ButtonType.lkas edge on the same signal so the MADS state machine
-    // observes both sides. MADS is what enables lateral without cruise engaged.
+    // -> byte 4 bits 0,1) is sunnypilot's MADS engage/disengage toggle. Values are
+    // 0=No_Pressed, 1=Pressed(short), 2=Long_Press, 3=Reserved. We ONLY treat the long
+    // press as the MADS trigger — short press is consumed by the car for the ACC
+    // follow-distance adjustment, so firing MADS on it would clash. Openpilot's carstate
+    // uses the same long-press-only predicate for the ButtonType.lkas edge, keeping the
+    // two sides in lockstep.
     if (msg->addr == 0x514U) {
       int rbs = msg->data[4] & 0x03U;
-      mads_button_press = (rbs != 0) ? MADS_BUTTON_PRESSED : MADS_BUTTON_NOT_PRESSED;
+      mads_button_press = (rbs == 2) ? MADS_BUTTON_PRESSED : MADS_BUTTON_NOT_PRESSED;
     }
   }
 

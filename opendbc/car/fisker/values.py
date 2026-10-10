@@ -60,12 +60,23 @@ GEAR_MAP = {
 
 
 # MFSS button mapping
+# Both MFS_RiBtnNorth and MFS_RiBtnEast engage the car's ACC on the vehicle side (VCU/ICC
+# treat them identically for cc_state transitions). On this port they differ in whether
+# openpilot MADS auto-engages lateral alongside the cruise→Active transition:
+#   MFS_RiBtnNorth  → ACC only (no MADS)   — default/safer, see carstate's mads_arm tracker
+#   MFS_RiBtnEast   → ACC + MADS (full UEM behaviour, matches older ports)
+# The two still emit the same ButtonType.mainCruise event; the per-button gating lives in
+# fisker.carstate (which writes the FiskerMadsArmed param) and sunnypilot/mads/mads.py
+# (which reads it in block_unified_engagement_mode).
 BUTTON_MAP = {
-  "MFS_RiBtnNorth":  "mainCruise",   # ADAS master on/off
+  "MFS_RiBtnNorth":  "mainCruise",   # ACC main — engages ACC only (MADS stays off)
+  "MFS_RiBtnEast":   "mainCruise",   # ACC main — engages ACC + arms MADS for UEM
   "MFS_LeRollPress": "setCruise",    # engage cruise
   "MFS_LeRollUp":    "accelCruise",  # +speed
   "MFS_LeRollDwn":   "decelCruise",  # -speed
-  "MFS_RiBtnSouth":  "lkas",         # MADS (sunnypilot) toggle
+  "MFS_RiBtnSouth":  "lkas",         # MADS (sunnypilot) toggle — LONG PRESS only (see
+                                     #   carstate._is_pressed), short press is used by
+                                     #   the car for ACC follow-distance adjustment.
   # cancel / resume / gapAdjustCruise: TBD from bench testing
 }
 
