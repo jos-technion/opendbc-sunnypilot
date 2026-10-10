@@ -274,16 +274,28 @@ class CarController(CarControllerBase):
                                                     driver_override=CS.driver_intervening,
                                                     lat_ctrl_typ=lat_ctrl_typ))
 
-      # EPS_0x1C2 spoof: emit one per real EPS tick (detected by AliveCounter change)
-      # so we don't flood ADAS with duplicates and trip its E2E validator. Only runs
-      # while we're commanding lateral (lat_engaged OR fade) because that's the only
-      # window where OEM would see a mismatch between its own Req=0 and the real EPS
-      # state. Outside this window we let the real EPS_0x1C2 flow through unchanged.
-      # Algorithm (CRC-8 J1850, data_id=0x90) verified against 200 captured frames
-      # from the on-vehicle bus; see test_eps_1c2_checksum_matches_captured_frames.
-      if self.last_spoofed_eps_1c2_alive != CS.eps_1c2_alive and CS.eps_1c2_values:
-        can_sends.append(self.fcan.create_eps_spoof_0x1c2(CS.eps_1c2_values))
-        self.last_spoofed_eps_1c2_alive = CS.eps_1c2_alive
+      # EPS_0x1C2 spoof: DISABLED. On-vehicle testing with the verified checksum
+      # algorithm (CRC-8 J1850, data_id=0x90) STILL caused ADAS errors in MADS and
+      # Both modes, even though the frames themselves are checksum-valid and the
+      # byte-6 override does what it claims. Hypothesis: the OEM ADAS doesn't only
+      # look at EPS_AdasLatCtrlSts on 0x1C2 — it probably cross-references with
+      # EPS_0x1C4 (driver torque) and/or EPS_0x475 (EPS mode) which we don't spoof,
+      # so the "Available" story we're telling on 0x1C2 contradicts the "actively
+      # being moved" story the other EPS signals still carry. Spoofing all three
+      # consistently would be the next step, but requires brute-forcing more
+      # checksums and risks more side-effects on the cluster. The fade-out alone
+      # addresses the disengage transient, which is the user-visible symptom.
+      #
+      # Everything stays in place for easy revival once we have a reason to try
+      # again with a multi-signal spoof:
+      #   * E2E_PARAMS entry (0x1C2: (0x90, 64)) in fiskercan.py — verified against
+      #     200 captured frames (test_checksum.py), can't hurt to keep.
+      #   * create_eps_spoof_0x1c2() in fiskercan.py — self-contained helper,
+      #     passes its own tests.
+      #   * EPS_0x1C2_SIGNALS + the carstate snapshot — same, harmless unused.
+      # if self.last_spoofed_eps_1c2_alive != CS.eps_1c2_alive and CS.eps_1c2_values:
+      #   can_sends.append(self.fcan.create_eps_spoof_0x1c2(CS.eps_1c2_values))
+      #   self.last_spoofed_eps_1c2_alive = CS.eps_1c2_alive
 
     # ---- Longitudinal (accel 0x121 + status 0x117/0x118 @ 100 Hz) ----
     # Same architecture as lateral (see comment above): send the whole triple across the

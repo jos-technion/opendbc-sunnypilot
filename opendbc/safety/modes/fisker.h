@@ -14,7 +14,6 @@
 //   TX  0x117  ADAS long control status   plain E2E, Sts/Typ (CC -> ACC transition)
 //   TX  0x118  ADAS long/ESP handshake    plain E2E, ESP-side mirror + jerk/prefill/AEB
 //   TX  0x52A  ICC settings spoof         bus 2 (to ADAS); plain E2E — see below
-//   TX  0x1C2  EPS state spoof            bus 2 (to ADAS); plain E2E — see below
 //   RX  0x115  wheel speeds -> vehicle_moving
 //   RX  0x318  vehicle speed + brake pedal
 //   RX  0x1C2  EPS steering angle
@@ -36,18 +35,12 @@ static bool fisker_icc_relay_active(void) {
   return safety_get_ts_elapsed(microsecond_timer_get(), fisker_icc_settings_tx_last) < FISKER_ICC_RELAY_TIMEOUT_US;
 }
 
-// EPS_0x1C2 spoof relay (50 ms): carcontroller re-emits EPS_0x1C2 on bus 2 with
-// AdasLatCtrlSts forced to Available during MADS engagement + the 500 ms fade. Panda
-// blocks the real EPS_0x1C2 from forwarding bus 0 → bus 2 only while openpilot has TX'd
-// its spoofed copy within the last FISKER_EPS_RELAY_TIMEOUT_US. 50 ms is 2.5 missed
-// 20 ms cycles — generous enough to tolerate carcontroller jitter without the OEM
-// ADAS seeing a bare EPS frame leak through.
-#define FISKER_EPS_RELAY_TIMEOUT_US 50000U
-static uint32_t fisker_eps_1c2_tx_last = 0U;
-
-static bool fisker_eps_1c2_relay_active(void) {
-  return safety_get_ts_elapsed(microsecond_timer_get(), fisker_eps_1c2_tx_last) < FISKER_EPS_RELAY_TIMEOUT_US;
-}
+// (EPS_0x1C2 spoof panda plumbing was removed again after on-vehicle testing showed
+// the spoofed byte-6 override doesn't quiet the OEM ADAS "LKA not available" alerts
+// in MADS/Both — probably because ADAS cross-references other EPS signals we don't
+// touch (0x1C4 torque, 0x475 mode). The Python-side helper + E2E data_id are kept
+// as-is in fiskercan.py for easy revival once we have reason to try again with a
+// multi-signal spoof. See the commented block at the spoof call site in carcontroller.py.)
 
 // Lateral TX relay (500 ms): carcontroller TXes 0x1D0/0x1C0 during MADS engagement AND
 // during the 500 ms post-disengage fade (Req=0 content), so the EPS transitions
@@ -220,11 +213,6 @@ static bool fisker_tx_hook(const CANPacket_t *msg) {
   if ((msg->addr == 0x52AU) && (msg->bus == 2U)) {
     fisker_icc_settings_tx_last = microsecond_timer_get();
   }
-  // EPS state spoof (0x1C2, bus 2): record the TX timestamp so the fwd_hook knows
-  // whether to keep blocking the real EPS_0x1C2 from forwarding bus 0 → bus 2.
-  if ((msg->addr == 0x1C2U) && (msg->bus == 2U)) {
-    fisker_eps_1c2_tx_last = microsecond_timer_get();
-  }
   // Lateral stream (0x1D0, 0x1C0, bus 0): record the TX timestamp so the fwd_hook can
   // keep blocking OEM 0x1D0/0x1C0 bus 2 → bus 0 across the full engaged window AND
   // the 500 ms post-disengage fade.
@@ -242,14 +230,13 @@ static safety_config fisker_init(uint16_t param) {
   // disable_static_blocking lets fisker_fwd_hook forward the OEM's 0x1D0 when disengaged
   // and block it only while openpilot steers; check_relay still guards against the OEM's
   // steering leaking onto bus 0.
-  // 0x52A + 0x1C2 go to the ADAS module on bus 2. No check_relay: a relay malfunction
-  // stops ALL forwarding, and bus 2 presence isn't reliable evidence of one —
-  // fisker_fwd_hook blocks the OEM originals via time-based relays instead.
+  // 0x52A goes to the ADAS module on bus 2. No check_relay: a relay malfunction stops
+  // ALL forwarding, and bus 2 presence isn't reliable evidence of one — fisker_fwd_hook
+  // blocks the OEM original via a time-based relay instead.
   static const CanMsg FISKER_TX_MSGS[] = {
     {0x1D0, 0, 8, .check_relay = true, .disable_static_blocking = true},    // steering angle
     {0x1C0, 0, 8, .check_relay = true, .disable_static_blocking = true},    // lateral activation
     {0x52A, 2, 8, .check_relay = false},                                    // ICC settings spoof (bus 2)
-    {0x1C2, 2, 8, .check_relay = false},                                    // EPS state spoof (bus 2)
   };
   static const CanMsg FISKER_LONG_TX_MSGS[] = {
     {0x1D0, 0, 8, .check_relay = true, .disable_static_blocking = true},    // steering angle
@@ -258,7 +245,6 @@ static safety_config fisker_init(uint16_t param) {
     {0x117, 0, 8, .check_relay = true, .disable_static_blocking = true},    // long control status
     {0x118, 0, 8, .check_relay = true, .disable_static_blocking = true},    // long/ESP handshake
     {0x52A, 2, 8, .check_relay = false},                                    // ICC settings spoof (bus 2)
-    {0x1C2, 2, 8, .check_relay = false},                                    // EPS state spoof (bus 2)
   };
 
   static RxCheck fisker_rx_checks[] = {
@@ -287,11 +273,10 @@ static safety_config fisker_init(uint16_t param) {
   const uint16_t FISKER_FLAG_LONGITUDINAL_CONTROL = 1;
   fisker_longitudinal = GET_FLAG(param, FISKER_FLAG_LONGITUDINAL_CONTROL);
 
-  // Initialise the ICC + EPS relay trackers. Seeding to "now" opens their windows
-  // immediately so the OEM's first bus-0 frames can't race openpilot's spoofs —
-  // openpilot is already pushing both by the time safety mode starts.
+  // Initialise the ICC relay tracker. Seeding to "now" opens its window immediately so
+  // the OEM's first bus-0 frame can't race openpilot's spoof — openpilot is already
+  // pushing 0x52A spoofs by the time safety mode starts.
   fisker_icc_settings_tx_last = microsecond_timer_get();
-  fisker_eps_1c2_tx_last = microsecond_timer_get();
   // Lateral relay stays idle at init — carcontroller only starts TXing lateral
   // when MADS engages, and we want OEM 0x1D0/0x1C0 to flow through until then.
   fisker_lat_tx_last = 0U;
@@ -335,16 +320,7 @@ static bool fisker_fwd_hook(int bus_num, int addr) {
     if ((addr == 0x52A) && fisker_icc_relay_active()) {
       block_msg = true;
     }
-    // EPS state spoof (0x1C2, EPS → ADAS): block the real EPS_0x1C2 from reaching
-    // bus 2 while openpilot is TXing its spoofed copy. The spoof masks
-    // EPS_AdasLatCtrlSts=Active (which would reveal that another controller is
-    // driving the EPS) as Available, keeping the OEM ADAS module from raising its
-    // "LKA not available" alert on the state mismatch between its own
-    // ADAS_LatCtrl_Req=0 and the real EPS=Active. Time-based relay naturally covers
-    // the engagement window AND the fade.
-    if ((addr == 0x1C2) && fisker_eps_1c2_relay_active()) {
-      block_msg = true;
-    }
+    // (EPS_0x1C2 block disabled — see fiskercan.py / carcontroller.py comments.)
   }
   return block_msg;
 }
