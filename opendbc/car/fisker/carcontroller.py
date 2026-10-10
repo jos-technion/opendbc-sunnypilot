@@ -69,6 +69,19 @@ class CarController(CarControllerBase):
     # would emit ~10 duplicates per OEM tick — the receiver's E2E monotonic-counter
     # validator would flag those as replays and reject them.
     self.last_spoofed_icc_alive = -1
+    # EPS_0x1C2 spoof: same cadence rule (one spoof per real OEM tick, ~50 Hz).
+    self.last_spoofed_eps_1c2_alive = -1
+
+    # Lateral fade-out: ticks remaining of post-disengage grace. On MADS falling edge
+    # we extend the TX window by this many ticks so the EPS sees Req=0 for a beat
+    # and transitions Active→Available smoothly, before our stream fully drops.
+    # Panda matches via a time-based lateral relay (see fisker_lat_relay_active in
+    # fisker.h): OEM 0x1D0/0x1C0 stays blocked while we've TX'd recently. The EPS
+    # 0x1C2 spoof runs over the same tx_lateral window so the OEM ADAS sees
+    # EPS=Available throughout, no mismatch, no "LKA not available" flash.
+    # 50 ticks @ 100 Hz = 500 ms.
+    self.lat_fade_remaining = 0
+    self.FADE_TICKS = 50
 
   def _maybe_verify_key(self, CS) -> None:
     """Verify the stored SecOC key against the GW sync MAC once at startup."""
@@ -207,9 +220,26 @@ class CarController(CarControllerBase):
       # secoc_window_ctr already got its +1 earlier in this update and won't increment
       # again this tick, so our first TX carries msg_counter matching OEM_current exactly.
       self.secoc_window_ctr = (self.secoc_window_ctr & ~0x3F) | (int(CS.oem_1d0_secoc_wire_ctr) & 0x3F)
-    self.was_lat_engaged_prev = lat_engaged
-
+    # Fade-out window: on lat_engaged falling edge we extend the TX window by FADE_TICKS
+    # so the EPS keeps receiving our Req=0 stream for a beat after disengage. During
+    # fade: panda's time-based lateral relay keeps blocking OEM 0x1D0/0x1C0, the EPS
+    # 0x1C2 spoof keeps running (OEM ADAS still sees EPS=Available), and the EPS
+    # transitions Active→Available smoothly off our commands rather than off a sudden
+    # OEM-command injection. Smooths the handoff and prevents the "LKA not available"
+    # flash that was coming from the OEM ADAS consistency check firing on EPS state
+    # changes it didn't ask for.
     if lat_engaged:
+      self.lat_fade_remaining = self.FADE_TICKS
+    elif self.was_lat_engaged_prev:
+      # Falling edge: fade timer was already reset above on rising, now kick it off
+      # (it was reset to FADE_TICKS during the last engaged tick, so no reset needed).
+      pass
+    self.was_lat_engaged_prev = lat_engaged
+    tx_lateral = lat_engaged or (self.lat_fade_remaining > 0)
+    if not lat_engaged and self.lat_fade_remaining > 0:
+      self.lat_fade_remaining -= 1
+
+    if tx_lateral:
       # Per-tick increment: alive matches OEM's tick rate exactly (both 100 Hz) so we
       # produce every value once in order, immune to read-jitter that would otherwise
       # cause skips (see prior "alive = oem_now" implementation which occasionally
@@ -225,6 +255,12 @@ class CarController(CarControllerBase):
       # (Typ=3), flag clear = LKA (Typ=1, baseline). The Ocean's EPS has historically
       # only honoured LKA, so defaulting to 1 keeps the port working.
       lat_ctrl_typ = 3 if (self.CP_SP.flags & FiskerFlagsSP.LAT_CTRL_LCA.value) else 1
+      # During the fade window lat_engaged is False → force the wire content to
+      # inactive (Req=0, Sts=0, Typ=0) regardless of what CC.latActive says, so the
+      # EPS releases immediately. apply_angle_last was already mirrored to the measured
+      # angle up above (apply_std_steer_angle_limits with lat_active=False returns the
+      # measured angle), so 0x1D0 just carries the current wheel position.
+      effective_lat_active = lat_active and lat_engaged
       steer_msg = self.fcan.create_steering_control(self.apply_angle_last, self.alive_1d0)
       can_sends.append(self._stamp(steer_msg, STEER_CAN_ID, trip, reset, self.secoc_window_ctr))
       # Also assert driver_override on the wire when the EPS tells us the driver is
@@ -234,9 +270,18 @@ class CarController(CarControllerBase):
       # — zero cost to flip the bit and see if it affects the EPS's internal
       # counter-torque gain. The Req=0 release is the actual override mechanism; this
       # bit is just a bonus signal.
-      can_sends.append(self.fcan.create_lat_control(lat_active, self.alive_1c0,
+      can_sends.append(self.fcan.create_lat_control(effective_lat_active, self.alive_1c0,
                                                     driver_override=CS.driver_intervening,
                                                     lat_ctrl_typ=lat_ctrl_typ))
+
+      # EPS_0x1C2 spoof: emit one per real EPS tick (detected by AliveCounter change)
+      # so we don't flood ADAS with duplicates and trip its E2E validator. Only runs
+      # while we're commanding lateral (lat_engaged OR fade) because that's the only
+      # window where OEM would see a mismatch between its own Req=0 and the real EPS
+      # state. Outside this window we let the real EPS_0x1C2 flow through unchanged.
+      if self.last_spoofed_eps_1c2_alive != CS.eps_1c2_alive and CS.eps_1c2_values:
+        can_sends.append(self.fcan.create_eps_spoof_0x1c2(CS.eps_1c2_values))
+        self.last_spoofed_eps_1c2_alive = CS.eps_1c2_alive
 
     # ---- Longitudinal (accel 0x121 + status 0x117/0x118 @ 100 Hz) ----
     # Same architecture as lateral (see comment above): send the whole triple across the

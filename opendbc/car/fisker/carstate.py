@@ -87,6 +87,27 @@ ICC_0x52A_SIGNALS = (
   "ICC_FCTA_Setting",
 )
 
+# Every signal in EPS_0x1C2 — same round-trip pattern as ICC_0x52A so carstate can
+# snapshot the whole frame and carcontroller can emit a bus-2 copy with just
+# EPS_AdasLatCtrlSts overridden to 1 (Available) during our MADS engagement. Hides
+# from the OEM ADAS module that another controller (us) is driving the EPS, which
+# otherwise shows up on the cluster as "LKA not available" because of the mismatch
+# between OEM's own ADAS_LatCtrl_Req=0 and the EPS reporting AdasLatCtrlSts=Active.
+EPS_0x1C2_SIGNALS = (
+  "EPS_1C2_CheckSum",
+  "EPS_1C2_AliveCounter",
+  "EPS_AbortFb",
+  "EPS_SteerWhlAgSig",
+  "EPS_SteerAgSnsrCalSts",
+  "EPS_SteerWhlAgSigVld",
+  "EPS_SteerWhlRotSpdDir",
+  "EPS_SteerWhlRotSpdVld",
+  "EPS_SteerWhlRotSpd",
+  "EPS_AdasLatCtrlSts",
+  "EPS_AdasLatCtrlStsVld",
+  "EPS_AsscMotCrtTq",
+)
+
 
 class CarState(CarStateBase):
   def __init__(self, CP, CP_SP):
@@ -124,6 +145,10 @@ class CarState(CarStateBase):
     self.icc_52a_values: dict[str, float] = {}
     self.icc_52a_alive = -1     # sentinel; -1 means "no ICC frame seen yet"
     self.icc_52a_seen = False
+
+    # EPS_0x1C2 cache for the LatCtrlSts spoof (see EPS_0x1C2_SIGNALS above).
+    self.eps_1c2_values: dict[str, float] = {}
+    self.eps_1c2_alive = -1
 
     # EPS lateral state cache + fault latches (see update()). Default to Off / No_Abort
     # so a startup race (CS consumed before first 0x1C2) reads as "EPS not yet in
@@ -403,6 +428,14 @@ class CarState(CarStateBase):
     self.oem_1d0_alive = int(oem_1d0["ADAS_1D0_AliveCounter"])
     self.oem_1c0_alive = int(oem_1c0["ADAS_1C0_AliveCounter"])
     self.oem_1d0_secoc_wire_ctr = (int(oem_1d0["ADAS_1D0_SSecOC_Fresh_Byte0"]) >> 2) & 0x3F
+
+    # ---- EPS lateral status (0x1C2) — snapshot for the spoof --------------
+    # EPS publishes this on bus 0 at ~50 Hz. During our MADS engagement we re-emit
+    # it on bus 2 with EPS_AdasLatCtrlSts forced to Available (see
+    # fiskercan.create_eps_spoof_0x1c2), so the OEM ADAS module can't see that
+    # the EPS is actually under our control.
+    self.eps_1c2_values = {k: eps_ang[k] for k in EPS_0x1C2_SIGNALS}
+    self.eps_1c2_alive = int(eps_ang["EPS_1C2_AliveCounter"])
 
     # ---- ICC settings frame (0x52A) — snapshot for the spoof --------------
     # ICC broadcasts 0x52A on bus 0 at ~10 Hz. We forward every field into a

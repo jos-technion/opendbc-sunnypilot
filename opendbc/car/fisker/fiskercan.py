@@ -322,3 +322,48 @@ class FiskerCAN:
       data = bytes(out)
 
     return ADDR, data, CANBUS.cam
+
+  def create_eps_spoof_0x1c2(self, eps_values: dict):
+    """Repack EPS_0x1C2 on the cam-side bus (toward the OEM ADAS module) with
+    EPS_AdasLatCtrlSts forced to 1 (Available_For_Control). This hides from the
+    ADAS module that another controller (us) is actively driving the EPS.
+
+    Context: the OEM ADAS cross-references its own ADAS_LatCtrl_Req against
+    EPS_AdasLatCtrlSts. During our MADS engagement we send ADAS_LatCtrl_Req=1
+    directly to the EPS on bus 0 and block the OEM's ADAS_LatCtrl_Req=0 from
+    reaching the EPS (fwd_hook). The EPS, under our control, reports
+    AdasLatCtrlSts=Active(2). But the OEM ADAS still sees its OWN state as
+    Req=0 — and now also sees EPS=Active via the forwarded 0x1C2. That
+    mismatch trips an internal consistency check: "I didn't ask for lateral,
+    why is EPS Active?" → raises "LKA not available" on the cluster for 1-2 s
+    on engagement, and again on disengage when EPS falls back to Available.
+
+    The fix: block the real EPS_0x1C2 on bus 0 → bus 2 while we're commanding
+    and send this spoofed copy instead. Only byte 6 bits 1..0 (AdasLatCtrlSts)
+    are overridden to 01 (Available); every other EPS reading — steer wheel
+    angle, torque, rotation, calibration, abort, validity bits — passes
+    through byte-identical. The CheckSum is adjusted via a CRC-8 XOR delta
+    (same math as the ICC spoof) so we don't need to know 0x1C2's data_id.
+
+    Bus routing: emitted on CANBUS.cam (bus 2, ADAS side). Panda's
+    fisker_fwd_hook blocks the OEM EPS_0x1C2 forwarding bus 0 → bus 2 while
+    we're actively TXing this spoof (time-based relay)."""
+    ADDR = 0x1C2
+    addr, data, _ = self.packer.make_can_msg("EPS_0x1C2", CANBUS.pt, eps_values)
+    assert addr == ADDR
+
+    orig_b6 = data[6]
+    # Force AdasLatCtrlSts (bits 1..0) to 01 = Available. Preserve the rest of
+    # byte 6 (AdasLatCtrlStsVld bits 3..2 and any high bits).
+    new_b6 = (orig_b6 & 0xFC) | 0x01
+
+    if new_b6 != orig_b6:
+      diff = bytearray(8)
+      diff[6] = orig_b6 ^ new_b6
+      delta_chk = fisker_icc_checksum_delta(bytes(diff))
+      out = bytearray(data)
+      out[0] ^= delta_chk
+      out[6] = new_b6
+      data = bytes(out)
+
+    return ADDR, data, CANBUS.cam
