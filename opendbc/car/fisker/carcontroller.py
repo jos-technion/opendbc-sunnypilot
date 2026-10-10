@@ -274,14 +274,20 @@ class CarController(CarControllerBase):
                                                     driver_override=CS.driver_intervening,
                                                     lat_ctrl_typ=lat_ctrl_typ))
 
-      # EPS_0x1C2 spoof: emit one per real EPS tick (detected by AliveCounter change)
-      # so we don't flood ADAS with duplicates and trip its E2E validator. Only runs
-      # while we're commanding lateral (lat_engaged OR fade) because that's the only
-      # window where OEM would see a mismatch between its own Req=0 and the real EPS
-      # state. Outside this window we let the real EPS_0x1C2 flow through unchanged.
-      if self.last_spoofed_eps_1c2_alive != CS.eps_1c2_alive and CS.eps_1c2_values:
-        can_sends.append(self.fcan.create_eps_spoof_0x1c2(CS.eps_1c2_values))
-        self.last_spoofed_eps_1c2_alive = CS.eps_1c2_alive
+      # EPS_0x1C2 spoof: DISABLED pending checksum verification. The spoof is built
+      # with the same CRC-8 J1850 XOR-delta trick as the ICC_0x52A spoof, which is
+      # correct IFF EPS_0x1C2 uses the same checksum algorithm (CRC-8 J1850 with
+      # init=0, xorout=0 and the "data_id ∥ payload[1:n]" input shape). If the
+      # algorithm differs, every spoofed frame has an invalid checksum, ADAS rejects
+      # them, and because panda is also blocking the real EPS_0x1C2 during our
+      # control, ADAS ends up with NO 0x1C2 input and raises a cascade of alerts.
+      # Keeping the TX path off until we have a captured EPS_0x1C2 to brute-force
+      # the data_id against and prove the delta is correct. The LKA-not-available
+      # alert on disengage is addressed by the fade-out alone for now — if that
+      # proves insufficient, re-enable this with a verified algorithm.
+      # if self.last_spoofed_eps_1c2_alive != CS.eps_1c2_alive and CS.eps_1c2_values:
+      #   can_sends.append(self.fcan.create_eps_spoof_0x1c2(CS.eps_1c2_values))
+      #   self.last_spoofed_eps_1c2_alive = CS.eps_1c2_alive
 
     # ---- Longitudinal (accel 0x121 + status 0x117/0x118 @ 100 Hz) ----
     # Same architecture as lateral (see comment above): send the whole triple across the

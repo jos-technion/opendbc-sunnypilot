@@ -335,16 +335,15 @@ static bool fisker_fwd_hook(int bus_num, int addr) {
     if ((addr == 0x52A) && fisker_icc_relay_active()) {
       block_msg = true;
     }
-    // EPS state spoof (0x1C2, EPS → ADAS): block the real EPS_0x1C2 from reaching
-    // bus 2 while openpilot is TXing its spoofed copy. The spoof masks
-    // EPS_AdasLatCtrlSts=Active (which would reveal that another controller is
-    // driving the EPS) as Available, keeping the OEM ADAS module from raising its
-    // "LKA not available" alert on the state mismatch between its own
-    // ADAS_LatCtrl_Req=0 and the real EPS=Active. Time-based relay naturally covers
-    // the engagement window AND the fade.
-    if ((addr == 0x1C2) && fisker_eps_1c2_relay_active()) {
-      block_msg = true;
-    }
+    // EPS state spoof (0x1C2) block DISABLED alongside the Python-side TX of
+    // this spoof — see carcontroller.py for the rationale. We keep the panda
+    // plumbing (tx allowlist entry, timestamp tracking, relay helper) wired up so
+    // re-enabling later is a one-line change here, but with openpilot not TXing
+    // the spoof the relay never activates and the real EPS_0x1C2 flows through
+    // naturally. Historical body of the block kept as a comment:
+    //   if ((addr == 0x1C2) && fisker_eps_1c2_relay_active()) {
+    //     block_msg = true;
+    //   }
   }
   return block_msg;
 }
