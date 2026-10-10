@@ -33,6 +33,9 @@ E2E_PARAMS: dict[int, tuple[int, int]] = {
   0x317: (205, 64),   # ADAS chime / takeover
   0x318: (121, 64),   # ESP vehicle speed
   0x31A: (55, 64),    # ADAS AEB / telltale
+  0x1C2: (0x90, 64),  # EPS lateral status (verified 2026-10-10 by brute-forcing 200
+                      # captured frames; CRC-8 J1850 with data_id=0x90 is the ONLY
+                      # match in the shared family)
 }
 
 

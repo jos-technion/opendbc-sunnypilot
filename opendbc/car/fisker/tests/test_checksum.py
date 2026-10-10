@@ -21,6 +21,24 @@ NON_SECOC_FRAMES = [
   (0x118, bytes.fromhex("32014A48441080D2")),
 ]
 
+# EPS_0x1C2 frames captured on-vehicle 2026-10-10. The algorithm (CRC-8 J1850,
+# data_id=0x90, length 64) was reverse-engineered by brute-forcing all polynomial +
+# init/xorout + data_id combinations against the full 200-frame capture; only the
+# shared Fisker-family parameterisation matches on every frame. Pin a representative
+# subset so a future accidental change to E2E_PARAMS[0x1C2] or fisker_plain_checksum
+# would break the suite loudly.
+EPS_0x1C2_FRAMES = [
+  (0x1C2, bytes.fromhex("980030bcb37f0500")),  # idle, straight
+  (0x1C2, bytes.fromhex("c50130bcb37f0500")),  # alive +1
+  (0x1C2, bytes.fromhex("3c0b30bca37f1500")),  # torque sign bit varied
+  (0x1C2, bytes.fromhex("f80e30bab37f0500")),  # alive wraparound (14)
+  (0x1C2, bytes.fromhex("d10c2a3dab71e50b")),  # steering wheel turned ~43°
+  (0x1C2, bytes.fromhex("070e2b2bab6ff50b")),  # non-zero AdasLatCtrlSts byte
+  (0x1C2, bytes.fromhex("12082da5ab74050b")),  # mid-sweep
+]
+
+NON_SECOC_FRAMES += EPS_0x1C2_FRAMES
+
 # SecOC-protected frames — CRC covers only bytes 1..3 (DataLength=32)
 SECOC_FRAMES = [
   # 0x121 ADAS accel command, DataID=23, DataLength=32

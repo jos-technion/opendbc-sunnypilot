@@ -169,6 +169,53 @@ def test_spoof_byte6_preserves_other_fields_regardless_of_terrain():
   assert data[6] & 0x01 == 1
 
 
+def test_eps_spoof_byte6_forces_available_and_routes_to_cam_bus():
+  """EPS_0x1C2 spoof forces AdasLatCtrlSts to 1 (Available) in byte 6 bits 1..0,
+  preserves every other bit of byte 6 (StsVld + high bits), and sends on bus 2."""
+  fcan, _ = _make_fcan()
+  from opendbc.car.fisker.carstate import EPS_0x1C2_SIGNALS
+  vals = {k: 0 for k in EPS_0x1C2_SIGNALS}
+  vals["EPS_AdasLatCtrlSts"] = 2       # Active (what EPS reports under our control)
+  vals["EPS_AdasLatCtrlStsVld"] = 1    # Valid (OEM baseline)
+  addr, data, bus = fcan.create_eps_spoof_0x1c2(vals)
+  assert addr == 0x1C2
+  assert bus == CANBUS.cam
+  # Low 2 bits of byte 6 now say Available (01); bits 3..2 (StsVld) stayed at 01.
+  assert (data[6] & 0x03) == 0x01
+  assert ((data[6] >> 2) & 0x03) == 0x01
+
+
+def test_eps_spoof_checksum_valid_under_verified_algorithm():
+  """With the EPS_0x1C2 algorithm now pinned (CRC-8 J1850, data_id=0x90), spoofing
+  byte 6 and patching byte 0 via the XOR-delta trick must produce a frame that
+  passes fisker_plain_checksum. Verifies both the delta logic AND that our
+  override of byte 6 doesn't accidentally disturb the checksum invariant.
+
+  The XOR delta trick is `new_chk = old_chk XOR crc(delta_payload)`, so the input
+  frame MUST have a valid old_chk for the output to also be valid — in the live
+  path that's always true because the input is a real EPS frame off the bus. We
+  mimic that here by first computing the valid checksum for the input values and
+  stuffing it into EPS_1C2_CheckSum before calling the spoof."""
+  from opendbc.car.fisker.carstate import EPS_0x1C2_SIGNALS
+  from opendbc.car.fisker.fiskercan import fisker_plain_checksum
+  fcan, packer = _make_fcan()
+  vals = {k: 0 for k in EPS_0x1C2_SIGNALS}
+  vals["EPS_SteerWhlAgSig"] = 500.0      # non-zero angle
+  vals["EPS_1C2_AliveCounter"] = 7
+  vals["EPS_AdasLatCtrlSts"] = 2
+  vals["EPS_AdasLatCtrlStsVld"] = 1
+  vals["EPS_AsscMotCrtTq"] = 3.5
+  # Seed a VALID checksum for the input so the spoof's XOR delta has something
+  # correct to transform.
+  vals["EPS_1C2_CheckSum"] = 0
+  _, zeroed, _ = packer.make_can_msg("EPS_0x1C2", CANBUS.pt, vals)
+  vals["EPS_1C2_CheckSum"] = fisker_plain_checksum(0x1C2, zeroed)
+  # Now spoof and verify the output is still checksum-valid.
+  _, spoofed, _ = fcan.create_eps_spoof_0x1c2(vals)
+  expected = fisker_plain_checksum(0x1C2, bytes([0]) + spoofed[1:])
+  assert spoofed[0] == expected, f"spoofed byte0=0x{spoofed[0]:02X} expected=0x{expected:02X}"
+
+
 def test_spoof_two_byte_overrides_fix_checksum_once():
   """When both byte 4 and byte 6 differ, the XOR delta must account for both so
   the resulting checksum is still valid under any hypothetical DataID."""
