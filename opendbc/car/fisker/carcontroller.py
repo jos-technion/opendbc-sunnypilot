@@ -62,7 +62,7 @@ class CarController(CarControllerBase):
     self.alive_1c0 = 0
     self.last_sent_alive_1d0 = -1   # invalid sentinel — force initialization at engage
     self.last_sent_alive_1c0 = -1
-    self.was_engaged_prev = False
+    self.was_lat_engaged_prev = False  # tracks lat_engaged (MADS) rising edge for OEM-counter seeding
 
     # ICC 0x52A spoof: emit ONE frame per OEM tick (detected by AliveCounter change).
     # ICC broadcasts at ~10 Hz while we control at 100 Hz, so a naive tx-every-tick
@@ -118,13 +118,20 @@ class CarController(CarControllerBase):
     alive = self.frame % 15
 
     # ---- Lateral (steering angle 0x1D0 + activation 0x1C0 @ 100 Hz) ----
-    # Send for the WHOLE engaged window so the cluster/EPS never see the frame disappear.
-    # Engagement can come from EITHER regular cruise (cruiseState.enabled) OR sunnypilot
-    # MADS (CC_SP.mads.enabled). The panda's fisker_fwd_hook mirrors this: it blocks the
-    # OEM's 0x1D0/0x1C0 on bus 2 whenever (controls_allowed || controls_allowed_lateral),
-    # which is the exact same window. If openpilot stops transmitting during that window
-    # (e.g. MADS engaged without cruise), the EPS receives NEITHER openpilot's frames
-    # nor the OEM's (panda blocks the OEM's) → LKA fault + wheel doesn't move.
+    # Lateral TX is driven by MADS, NOT by cruise. In ACC-only mode (RiBtnNorth engaged
+    # ACC without arming MADS) openpilot stays transparent on the lateral path so the
+    # OEM ADAS keeps running its own LKA (gated by the user's ICC_LKASetting). The
+    # panda's fisker_fwd_hook has the matching rule: it only blocks OEM 0x1D0/0x1C0 on
+    # `controls_allowed_lateral`, not plain `controls_allowed` — otherwise the OEM
+    # thinks LKA has become unavailable because its 0x1D0 never reaches bus 0.
+    #
+    # Engagement variables:
+    #   `engaged`     – ACC OR MADS. Gates the long path + SecOC window-counter housekeeping.
+    #   `lat_engaged` – MADS only. Gates the lateral TX (0x1D0 + 0x1C0) and the
+    #                   OEM-counter seeding (which only matters when we're about to start
+    #                   transmitting). Rising edge of lat_engaged is the moment we snap
+    #                   our aliveCounter / SecOC wire counter to OEM's current value so
+    #                   our first TX continues OEM's numbering seamlessly.
     #
     # Driver-override release. CS.driver_intervening is driven by the EPS's dedicated
     # EPS_DrvrIntvSteerWhlDetd bit (0x1C4) — a conservative "real driver overpower"
@@ -139,6 +146,7 @@ class CarController(CarControllerBase):
     # nudges feed ALC while hard overpower releases the EPS.
     mads_engaged = bool(CC_SP.mads.enabled) if CC_SP is not None else False
     engaged = (CS.out.cruiseState.enabled or mads_engaged) and secoc_ok
+    lat_engaged = mads_engaged and secoc_ok
     lat_active = CC.latActive and secoc_ok and not CS.driver_intervening
     self.apply_angle_last = apply_std_steer_angle_limits(
       actuators.steeringAngleDeg, self.apply_angle_last, CS.out.vEgoRaw,
@@ -168,7 +176,11 @@ class CarController(CarControllerBase):
     # resets on GW Reset boundary. At engage rising edge we snap it to OEM's observed
     # counter so we start matching OEM's actual counter value, then let the free-running
     # increment carry it forward.
-    if engaged and not self.was_engaged_prev:
+    # Seed on lat_engaged rising edge, not engaged. During ACC-only, OEM's 0x1D0/0x1C0
+    # continue to flow through panda to the EPS, so our counters mustn't start ticking
+    # ahead of OEM — if we did and MADS later rose, our first TX would be out-of-sync
+    # with OEM's current value by however many ticks the ACC-only window lasted.
+    if lat_engaged and not self.was_lat_engaged_prev:
       # Rising edge: seed our alive to (OEM_current - 1) so that AFTER the standard
       # per-tick increment below, our first-TX alive equals OEM_current — matching the
       # value OEM's blocked frame would have carried. This is the "we ARE OEM" model:
@@ -181,15 +193,13 @@ class CarController(CarControllerBase):
       # Clean handoff both directions, no +1 jump at engage, no duplicate at disengage.
       self.alive_1d0 = (int(CS.oem_1d0_alive) - 1) % 15
       self.alive_1c0 = (int(CS.oem_1c0_alive) - 1) % 15
-      # SecOC msg counter: snap low 6 bits to (OEM_wire - 1) mod 64. The free-running
-      # secoc_window_ctr already got its +1 earlier in this update, so after this snap
-      # + no further change, secoc_window_ctr's low bits = OEM_wire - 1. Then... wait,
-      # we WANT low bits = OEM_wire on first TX. So snap to OEM_wire directly (no -1),
-      # since secoc_window_ctr is NOT going to increment again in this tick.
+      # SecOC msg counter: snap low 6 bits to OEM_wire. The free-running
+      # secoc_window_ctr already got its +1 earlier in this update and won't increment
+      # again this tick, so our first TX carries msg_counter matching OEM_current exactly.
       self.secoc_window_ctr = (self.secoc_window_ctr & ~0x3F) | (int(CS.oem_1d0_secoc_wire_ctr) & 0x3F)
-    self.was_engaged_prev = engaged
+    self.was_lat_engaged_prev = lat_engaged
 
-    if engaged:
+    if lat_engaged:
       # Per-tick increment: alive matches OEM's tick rate exactly (both 100 Hz) so we
       # produce every value once in order, immune to read-jitter that would otherwise
       # cause skips (see prior "alive = oem_now" implementation which occasionally

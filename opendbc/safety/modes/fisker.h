@@ -265,10 +265,13 @@ static bool fisker_fwd_hook(int bus_num, int addr) {
   // 0x1D0 is forwarded so the EPS keeps receiving a steering frame.
   bool block_msg = false;
   if (bus_num == 2) {
-    // steering angle (0x1D0) + lateral activation (0x1C0): openpilot replaces both while
-    // engaged (cruise or MADS-only), so block the OEM's from reaching the vehicle;
-    // forward them when disengaged.
-    if (((addr == 0x1D0) || (addr == 0x1C0)) && (controls_allowed || controls_allowed_lateral)) {
+    // Steering angle (0x1D0) + lateral activation (0x1C0): openpilot replaces both only
+    // when it's actually commanding lateral — i.e. controls_allowed_lateral. In ACC-only
+    // mode (controls_allowed set by cruise but MADS not armed) we must NOT block the OEM
+    // lateral stream, otherwise the ADAS module sees its 0x1D0 silently dropped on the
+    // car side and raises "LKA not available". carcontroller matches this by only TXing
+    // lateral under its own lat_engaged (MADS) gate — the two sides stay in lockstep.
+    if (((addr == 0x1D0) || (addr == 0x1C0)) && controls_allowed_lateral) {
       block_msg = true;
     }
     // Longitudinal (0x121) is unaffected by MADS — MADS is lateral-only. Only block the
