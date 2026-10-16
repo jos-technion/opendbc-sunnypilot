@@ -18,6 +18,24 @@ VisualAlert = structs.CarControl.HUDControl.VisualAlert
 STEER_CAN_ID = 0x1D0
 ACCEL_CAN_ID = 0x121
 
+# Phone-over-wifi remote-control gating. See
+# openpilot/sunnypilot/selfdrive/remote_control/remote_control_server.py for
+# the Params producer. All three are CLEAR_ON_MANAGER_START so a reboot
+# always comes up with the app disabled.
+#   * stale after this long: carcontroller falls back to sunnypilot's planner.
+#     Chosen to be ~10× the server's command interval (~33 ms @ 30 Hz) so a
+#     single dropped packet is survivable but a dead wifi link disengages
+#     within one 1/3 second window.
+REMOTE_STALE_NS = 300_000_000  # 300 ms
+#   * low-speed-only. 10 mph in m/s. Above this we refuse to apply the remote
+#     angle no matter what the server says — a wifi-latency-limited slider is
+#     not an acceptable highway input device.
+REMOTE_MAX_SPEED_MS = 10 * 0.44704  # ~4.47 m/s
+#   * poll the params lazily — opendbc test harness on macOS doesn't have
+#     libparams_c and Params() crashes test_car_interfaces at import. On
+#     device the import succeeds. Follows the same shape as
+#     carstate._set_mads_arm above.
+
 
 class CarController(CarControllerBase):
   def __init__(self, dbc_names, CP, CP_SP):
@@ -83,6 +101,12 @@ class CarController(CarControllerBase):
     self.lat_fade_remaining = 0
     self.FADE_TICKS = 50
 
+    # Phone-over-wifi remote-control state. Lazy-init'd on first update() tick
+    # so the opendbc test harness (which has no libparams_c on macOS) can
+    # instantiate CarController without blowing up. See REMOTE_* constants.
+    self._remote_params = None
+    self._remote_warned = False
+
   def _maybe_verify_key(self, CS) -> None:
     """Verify the stored SecOC key against the GW sync MAC once at startup."""
     if self.secoc_key_verified or not CS.secoc_sync_seen or not self.secoc_key:
@@ -100,6 +124,51 @@ class CarController(CarControllerBase):
     addr, data, bus = msg
     stamped = stamp_secoc(self.secoc_key, can_id, data, trip, reset, msg_counter)
     return addr, stamped, bus
+
+  def _remote_steer_override(self, planner_angle_deg: float, v_ego: float, now_nanos: int) -> float:
+    """If the phone remote-control app is armed AND fresh AND we're below the low-speed
+    cap, replace the lateral planner's commanded steering angle with the phone's angle.
+    All downstream safety (rate limiter, driver intervention, SecOC, panda tx_hook)
+    runs on top of the substituted value unchanged — same as if sunnypilot itself had
+    commanded that angle.
+
+    Returns the (possibly substituted) commanded angle. Fails open: any error
+    (Params unavailable, parse failure, stale timestamp, overspeed) falls back to the
+    planner angle so sunnypilot continues to control steering normally."""
+    if self._remote_params is None:
+      try:
+        from openpilot.common.params import Params
+        self._remote_params = Params()
+      except Exception:  # noqa: BLE001 — no params → never override
+        return planner_angle_deg
+
+    try:
+      if not self._remote_params.get_bool("RemoteControlEnabled"):
+        return planner_angle_deg
+      last_raw = self._remote_params.get("RemoteSteerLastUpdate")
+      angle_raw = self._remote_params.get("RemoteSteerAngle")
+      if not last_raw or not angle_raw:
+        return planner_angle_deg
+      last_ns = int(last_raw.decode() if isinstance(last_raw, (bytes, bytearray)) else last_raw)
+      remote_angle = float(angle_raw.decode() if isinstance(angle_raw, (bytes, bytearray)) else angle_raw)
+    except Exception:  # noqa: BLE001 — any corruption → fall back to planner
+      return planner_angle_deg
+
+    # Freshness watchdog. The phone POSTs /steer at ~30 Hz; a connection drop
+    # or wifi stall shows up here as the age blowing past REMOTE_STALE_NS and
+    # we silently hand steering back to sunnypilot's planner. The server-side
+    # watchdog on the carcontroller is the authoritative one — the server
+    # also auto-disarms if the UI loses connectivity, but we don't rely on
+    # that because the carcontroller may still have a stale "armed=True" with
+    # a last-update timestamp hours old.
+    if now_nanos - last_ns > REMOTE_STALE_NS:
+      return planner_angle_deg
+    # Low-speed only. The whole point of this feature is to steer the car
+    # at parking speeds from outside the vehicle; a wifi-latency-limited
+    # slider is not a replacement for an ADAS at any speed above walking pace.
+    if v_ego > REMOTE_MAX_SPEED_MS:
+      return planner_angle_deg
+    return remote_angle
 
   def update(self, CC, CC_SP, CS, now_nanos):
     actuators = CC.actuators
@@ -171,8 +240,25 @@ class CarController(CarControllerBase):
     engaged = (CS.out.cruiseState.enabled or mads_active) and secoc_ok
     lat_engaged = mads_active and secoc_ok
     lat_active = CC.latActive and secoc_ok and not CS.driver_intervening
+
+    # Phone remote-control substitution: swap the planner's commanded angle for
+    # the phone-supplied angle BEFORE the rate limiter. Keeping it before the
+    # rate limiter means the exact same slew/saturation limits that constrain
+    # the sunnypilot planner also constrain the phone — the phone can't send a
+    # ±600° step command and bypass the EPS's safety envelope. All of our other
+    # safety (SecOC, driver intervention, panda tx_hook angle rate limits) is
+    # downstream of this substitution and runs unchanged.
+    #
+    # Gated by lat_engaged: MADS still has to be commanding steering for the
+    # phone's commands to reach the EPS. If MADS isn't engaged, we're not
+    # transmitting 0x1D0 anyway and the substituted actuators.steeringAngleDeg
+    # just affects what new_actuators carries back on the car bus for logging.
+    desired_angle_deg = float(actuators.steeringAngleDeg)
+    if lat_engaged:
+      desired_angle_deg = self._remote_steer_override(desired_angle_deg,
+                                                       CS.out.vEgoRaw, now_nanos)
     self.apply_angle_last = apply_std_steer_angle_limits(
-      actuators.steeringAngleDeg, self.apply_angle_last, CS.out.vEgoRaw,
+      desired_angle_deg, self.apply_angle_last, CS.out.vEgoRaw,
       CS.out.steeringAngleDeg, lat_active, self.params.ANGLE_LIMITS,
     )
 
