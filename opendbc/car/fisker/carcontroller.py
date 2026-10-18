@@ -337,16 +337,19 @@ class CarController(CarControllerBase):
     # duplicates).
     #
     # GW reset handling. On-vehicle 2026-10-19 (OEM-vs-ours CMP instrumentation)
-    # showed exactly what the counter does at a ~1 Hz GW reset: the per-window HIGH
-    # bits restart to 0, but the 6-bit WIRE value is CONTINUOUS — OEM's wire stepped
-    # 37->38 straight through the reset, it did not drop. So at the reset we advance
-    # +1 and zero ONLY the high bits (& 0x3F), keeping the low 6 bits continuous.
+    # finally showed what the counter does at a ~1 Hz GW reset: OEM RESTARTS its
+    # 0x1D0 SecOC counter (our CMP caught OEM's wire drop from ~40 to ~0 the moment
+    # its reset_bits flipped). So the per-window counter is NOT continuous across a
+    # reset — it restarts. The EPS only sees OUR 0x1D0 (OEM's is blocked), so it
+    # follows our stream: when our reset field increments it expects the counter to
+    # restart. We restart to 1 (the documented "first frame after reset" value), in
+    # lockstep with our own reset_bits (both driven by CS.secoc_reset), so the
+    # freshness we sign and the freshness the EPS reconstructs stay consistent.
     #
-    # The previous code re-snapped the WHOLE counter from carstate's oem_full at the
-    # reset; because oem_full's low bits are cereal-lagged (~25 counts behind OEM's
-    # actual bus-2 wire at that instant), that yanked our wire value backward ~25 —
-    # the EPS saw a replay and aborted (abort=8). Keeping the low bits free-running
-    # avoids the backward jump entirely.
+    # Do NOT re-snap to carstate's oem_full at the reset: OEM's 0x1D0 restarts ~10 ms
+    # AFTER the GW_Syn_All reset (CMP showed oursResetBits flip a tick before OEM's),
+    # so at the GW_Syn_All edge carstate's OEM wire is still the stale pre-restart
+    # value — re-snapping to it yanked our counter ~25 backward -> EPS replay abort.
     long_txing = self.CP.openpilotLongitudinalControl and (engaged or self.long_ever_active)
     txing_secoc = tx_lateral or long_txing
     if txing_secoc:
@@ -354,8 +357,8 @@ class CarController(CarControllerBase):
         # Block moment: seed the full per-window counter from OEM's current value.
         self.secoc_window_ctr = int(CS.oem_1d0_secoc_full_ctr) + 1
       elif reset != self.secoc_reset_prev:
-        # GW reset: advance the wire counter but restart the per-window high bits.
-        self.secoc_window_ctr = (self.secoc_window_ctr + 1) & 0x3F
+        # GW reset: per-window counter restarts at 1.
+        self.secoc_window_ctr = 1
       else:
         self.secoc_window_ctr += 1
       self.secoc_reset_prev = reset
