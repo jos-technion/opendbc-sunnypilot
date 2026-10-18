@@ -63,7 +63,8 @@ class CarController(CarControllerBase):
     # the EPS rejects. Re-snap on a GW Reset boundary (counter restarts there). 0x1D0 and
     # 0x121 share the index (same 100 Hz restart), so the longitudinal path uses it too.
     self.secoc_window_ctr = 0
-    self.was_tx_secoc_prev = False  # rising edge of "transmitting any SecOC PDU" -> seed counter once
+    self.was_tx_secoc_prev = False  # rising edge of "transmitting any SecOC PDU" -> seed counter
+    self.secoc_reset_prev = None    # GW reset change while transmitting -> re-seed to the new window
 
     self.secoc_key_verified = False
     self.secoc_warn_logged = False
@@ -335,19 +336,22 @@ class CarController(CarControllerBase):
     # the EPS rejects (on-vehicle 2026-10-19: continuous-mirror produced STEP-0
     # duplicates).
     #
-    # Do NOT re-snap on a GW reset. The msg_counter is continuous across resets
-    # (verified on-vehicle: it stepped 37->38 through a reset, did not restart). The
-    # separate GW `reset` field rides into the wire byte + MAC from CS.secoc_reset on
-    # its own; it must not disturb our free-running msg_counter. An earlier version
-    # re-snapped on reset change and jolted the counter at the ~1 Hz reset boundary,
-    # faulting the EPS mid-engagement.
+    # Re-snap on a GW reset too. The MAC's high bits are a per-reset-window count that
+    # the EPS zeroes each ~1 Hz GW reset (see carstate), so our free-run must re-align
+    # to OEM's post-reset value or every subsequent MAC fails. Re-snapping to
+    # oem_full + 1 on the reset change does that. (Residual: our carstate observes the
+    # reset ~cereal-lag after the EPS sees it on-bus, so a few frames during that window
+    # still carry the pre-reset counter and fail — this is the one handoff the userspace
+    # path can't make atomic; the real fix is panda-side SecOC stamping, which sees the
+    # reset at bus speed. See notes.)
     long_txing = self.CP.openpilotLongitudinalControl and (engaged or self.long_ever_active)
     txing_secoc = tx_lateral or long_txing
     if txing_secoc:
-      if not self.was_tx_secoc_prev:
+      if (not self.was_tx_secoc_prev) or (reset != self.secoc_reset_prev):
         self.secoc_window_ctr = int(CS.oem_1d0_secoc_full_ctr) + 1
       else:
         self.secoc_window_ctr += 1
+      self.secoc_reset_prev = reset
     self.was_tx_secoc_prev = txing_secoc
 
     # Lateral E2E alive counters (0x1D0 / 0x1C0): same seed-once-then-+1, from each
