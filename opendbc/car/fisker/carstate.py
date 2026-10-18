@@ -135,6 +135,19 @@ class CarState(CarStateBase):
     self.oem_1c0_alive = 0
     self.oem_1d0_secoc_wire_ctr = 0    # (byte >> 2) & 0x3F — lower 6 bits of msg_counter
 
+    # Reconstructed FULL SecOC msg_counter for 0x1D0. Only 6 bits are on the wire;
+    # the real counter is a free-running per-reset-window index the EPS validates
+    # against its own clock-based reconstruction. We rebuild it here by counting
+    # 6-bit wraps since the last GW reset, so the carcontroller can mirror OEM's
+    # authoritative value (high bits included) rather than free-run its own — which
+    # drifts out of the EPS's reconstruction window and makes the SecOC MAC fail
+    # intermittently a few frames into engagement (observed on-vehicle 2026-10-19:
+    # EPS goes Active then faults abort=8 depending on where in the window we engaged).
+    self.oem_1d0_secoc_full_ctr = 0
+    self._oem_secoc_wraps = 0
+    self._oem_secoc_wire_last = 0
+    self._oem_secoc_reset_tracked = None
+
     # ICC_0x52A cached values. This is the ICC settings frame we spoof on bus 2 when
     # cruise is engaged: we forward every OEM signal untouched EXCEPT ICCACCFuncTyp
     # (which we force to 2 so the ADAS module treats us as "type-2" ACC). Storing the
@@ -427,7 +440,21 @@ class CarState(CarStateBase):
     oem_1c0 = cp_cam.vl["ADAS_0x1C0"]
     self.oem_1d0_alive = int(oem_1d0["ADAS_1D0_AliveCounter"])
     self.oem_1c0_alive = int(oem_1c0["ADAS_1C0_AliveCounter"])
-    self.oem_1d0_secoc_wire_ctr = (int(oem_1d0["ADAS_1D0_SSecOC_Fresh_Byte0"]) >> 2) & 0x3F
+    cur_wire = (int(oem_1d0["ADAS_1D0_SSecOC_Fresh_Byte0"]) >> 2) & 0x3F
+    self.oem_1d0_secoc_wire_ctr = cur_wire
+    # Rebuild the full counter: reset the wrap count whenever the GW reset counter
+    # changes (both OEM and EPS zero their per-window index on that boundary), and
+    # bump it each time the 6-bit wire value wraps 63 -> 0. Guard against a missed
+    # sample resetting the count: a wrap is only a decrease, which we always catch
+    # as long as we don't skip a full 64-frame span (we run at the same 100 Hz as
+    # the OEM stream, so that never happens in practice).
+    if self.secoc_reset != self._oem_secoc_reset_tracked:
+      self._oem_secoc_reset_tracked = self.secoc_reset
+      self._oem_secoc_wraps = 0
+    elif cur_wire < self._oem_secoc_wire_last:
+      self._oem_secoc_wraps += 1
+    self._oem_secoc_wire_last = cur_wire
+    self.oem_1d0_secoc_full_ctr = self._oem_secoc_wraps * 64 + cur_wire
 
     # ---- EPS lateral status (0x1C2) — snapshot for the spoof --------------
     # EPS publishes this on bus 0 at ~50 Hz. During our MADS engagement we re-emit

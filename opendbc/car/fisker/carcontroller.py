@@ -51,12 +51,11 @@ class CarController(CarControllerBase):
     # Reset counter (0x20) increments, then +1 per 100 Hz frame (reaching ~101 before the
     # next Reset ~1 s later). Only the low 6 bits appear on the wire (SSecOC_Fresh_Byte0);
     # the MAC authenticates the full 64-bit freshness. The EPS reconstructs this window
-    # index for anti-replay, so we must reproduce it exactly — a free monotonic counter
-    # diverges from the window rule and
-    # the EPS rejects every frame (no actuation + ADAS fault). 0x1D0 and 0x121 are both
-    # 100 Hz and restart on the same boundary, so they share the index value.
+    # index for anti-replay, so we must reproduce it exactly. We do NOT free-run our own
+    # copy (that drifts out of the EPS's reconstruction window); instead we mirror OEM's
+    # reconstructed full counter from carstate each tick (see update()). 0x1D0 and 0x121
+    # are both 100 Hz and restart on the same boundary, so they share the index value.
     self.secoc_window_ctr = 0
-    self.secoc_prev_reset = None
 
     self.secoc_key_verified = False
     self.secoc_warn_logged = False
@@ -195,10 +194,27 @@ class CarController(CarControllerBase):
     # 100 Hz control rate and restarts on every GW Reset change, so at engagement it
     # already matches the OEM/EPS window position: the first injected 0x1D0 is accepted
     # and every subsequent window stays in lockstep (both restart at 1 on each boundary).
-    if reset != self.secoc_prev_reset:
-      self.secoc_window_ctr = 0
-      self.secoc_prev_reset = reset
-    self.secoc_window_ctr += 1
+    # SecOC msg counter: mirror OEM's authoritative FULL counter (reconstructed in
+    # carstate from the 6 wire bits + wrap tracking) and add 1 — the next value the
+    # EPS expects. OEM's counter is a real-time, per-reset-window index; mirroring it
+    # keeps our injected freshness aligned with the EPS's clock-based reconstruction
+    # (high bits included) on every frame, so the MAC validates for the whole
+    # engagement. The previous free-running counter (seeded once at engage) drifted
+    # out of the EPS's reconstruction window and made the MAC fail intermittently a
+    # few frames in — EPS would go Active then fault abort=8 depending on where in
+    # the window we engaged (on-vehicle 2026-10-19). OEM 0x1D0 and 0x121 share this
+    # per-window index (same 100 Hz restart boundary), so the longitudinal path uses
+    # the same value.
+    self.secoc_window_ctr = int(CS.oem_1d0_secoc_full_ctr) + 1
+
+    # E2E AliveCounters for the lateral PDUs: mirror OEM's current value + 1 (the
+    # next value the EPS expects) every tick, same principle as the SecOC counter
+    # above. Mirroring OEM's authoritative, real-time counter — rather than
+    # free-running our own seeded copy — keeps us aligned with the EPS across any
+    # control-loop jitter and across the 15-count wrap. OEM 0x1D0 and 0x1C0 have
+    # independent alive counters, so track each from its own source.
+    self.alive_1d0 = (int(CS.oem_1d0_alive) + 1) % 15
+    self.alive_1c0 = (int(CS.oem_1c0_alive) + 1) % 15
 
     # E2E AliveCounter (byte1 low nibble): 0..14 counter, +1 per frame, never 15 (15 is
     # the E2E invalid sentinel — DBC range [0|14]). For LATERAL (0x1D0/0x1C0) we track
@@ -275,65 +291,25 @@ class CarController(CarControllerBase):
       CS.out.steeringAngleDeg, lat_active, self.params.ANGLE_LIMITS,
     )
 
-    # "We ARE OEM" AliveCounter substitution — seed once from OEM at engage, then
-    # increment 1 per tick to stay in perfect lockstep with OEM (both at 100 Hz).
+    # "We ARE OEM" counter continuation. All three counters (alive_1d0, alive_1c0,
+    # secoc_window_ctr) are mirrored from OEM's authoritative bus-2 values + 1 at the
+    # top of update() — see there. OEM's counters advance in real time regardless of
+    # our control-loop jitter, so mirroring them keeps our injected stream on exactly
+    # the value the EPS expects next, both at the engage handoff and on every frame
+    # after. Panda blocks OEM's own 0x1D0/0x1C0 from the EPS while we TX, so the EPS
+    # sees a seamless continuation of OEM's numbering through our frames.
     #
-    # Illustrating (0x1D0 example):
     #   OEM on bus 2 (all ticks):        1  2  3  4  5  6  7  8  9  10 11 12
     #   Panda forwards to bus 0:         1  2  3  4                    11 12
     #                                    └── ENGAGE ──┘     └─ DISENGAGE
-    #   Our TX (self-incrementing):               5  6  7  8  9  10
-    #
-    # Previous version used `alive = OEM_bus2_current` per-tick. Problem: if OEM ticked
-    # twice between our two carcontroller reads (tick jitter), we'd read a value that
-    # skipped one from our last-sent — creating a +2 jump on the wire that the E2E
-    # validator rejects. After a few of these, LKA faults mid-engagement.
-    #
-    # Seed-and-increment eliminates that: our counter marches at exactly our tick rate
-    # (which is nominally the same as OEM's), so we produce every value once, in order,
-    # regardless of when OEM's frames land in carstate.
-    #
-    # SecOC msg counter uses the same seed-and-increment idea — the per-Reset-window
-    # free-running counter (self.secoc_window_ctr) already increments +1 per tick and
-    # resets on GW Reset boundary. At engage rising edge we snap it to OEM's observed
-    # counter so we start matching OEM's actual counter value, then let the free-running
-    # increment carry it forward.
-    # Seed on lat_engaged rising edge, not engaged. During ACC-only, OEM's 0x1D0/0x1C0
-    # continue to flow through panda to the EPS, so our counters mustn't start ticking
-    # ahead of OEM — if we did and MADS later rose, our first TX would be out-of-sync
-    # with OEM's current value by however many ticks the ACC-only window lasted.
+    #   Our TX (= OEM_bus2 + 1):                   6  7  8  9  10 11
     if lat_engaged and not self.was_lat_engaged_prev:
-      # Rising edge: start the engage-delay window. During the delay we DO NOT
-      # TX; we just re-snap OEM counters each tick so by the time we start
-      # transmitting, we're using OEM's latest observed values — eliminating
-      # the duplicate-counter race against OEM frames that reach the EPS
-      # before our panda relay engages.
+      # Rising edge: start the engage-delay window. During the delay we DO NOT TX —
+      # we let OEM's own 0x1D0/0x1C0 keep flowing to the EPS so the handoff point is
+      # clean, and our counters are already mirroring OEM continuously (set at the
+      # top of update()), so the first TX after the delay lands on OEM_current + 1.
       self.engage_delay_remaining = self.ENGAGE_DELAY_TICKS
     if lat_engaged and self.engage_delay_remaining > 0:
-      # During the delay, refresh our seeds from the latest carstate every tick.
-      # alive_1d0/1c0: snap to OEM-current. The TX block's `+1 per tick`
-      # increment turns this into OEM-current+1 at TX time, which is the next
-      # value EPS expects.
-      self.alive_1d0 = int(CS.oem_1d0_alive) % 15
-      self.alive_1c0 = int(CS.oem_1c0_alive) % 15
-      # SecOC wire counter: snap to OEM_wire (NO +1 here). The pre-tick
-      # `secoc_window_ctr += 1` at the top of update() runs on EVERY tick,
-      # including the first TX tick after the delay elapses. So on that TX
-      # tick, pre-tick adds +1 to whatever we snapped — bringing low bits to
-      # (OEM_wire + 1), which is exactly what EPS expects next.
-      #
-      # The ORIGINAL (no-delay) design used `OEM_wire + 1` in the snap,
-      # correctly, because snap and TX happened on the SAME tick: pre-tick
-      # ran, snap OVERWROTE to OEM_wire+1, TX used that. In this delay
-      # design the snap-ticks and TX-tick are different, so the pre-tick
-      # between them adds a second +1 if we don't correct here.
-      #
-      # Observed on-vehicle 2026-10-19 (south-button engagement, EPS went
-      # Active then faulted ~100 ms later with abort=8): every TX during
-      # engagement was +1 ahead of EPS's expected counter, so EPS marked
-      # each as a "skip-by-1". After ~5 frames of consistently-skipped
-      # counters EPS gave up and raised abort=8 (CAN).
-      self.secoc_window_ctr = (self.secoc_window_ctr & ~0x3F) | (int(CS.oem_1d0_secoc_wire_ctr) & 0x3F)
       self.engage_delay_remaining -= 1
     # Fade-out window: on lat_engaged falling edge we extend the TX window by FADE_TICKS
     # so the EPS keeps receiving our Req=0 stream for a beat after disengage. During
@@ -365,17 +341,10 @@ class CarController(CarControllerBase):
     tx_lateral = (lat_engaged and self.engage_delay_remaining == 0) or in_fade
 
     if tx_lateral:
-      # Per-tick increment: alive matches OEM's tick rate exactly (both 100 Hz) so we
-      # produce every value once in order, immune to read-jitter that would otherwise
-      # cause skips (see prior "alive = oem_now" implementation which occasionally
-      # jumped +2 and tripped E2E validation).
-      self.alive_1d0 = (self.alive_1d0 + 1) % 15
-      self.alive_1c0 = (self.alive_1c0 + 1) % 15
-      # secoc_window_ctr's per-tick increment already happened earlier in this update
-      # (free-running block above). On rising edge tick it was set to OEM_wire and no
-      # further change is applied this tick, so our first TX carries msg_counter
-      # matching OEM_current exactly. From next tick on, the free-running increment
-      # carries it forward in lockstep with OEM.
+      # alive_1d0/1c0 and secoc_window_ctr were already set at the top of update()
+      # by mirroring OEM's authoritative counters (+1), so no per-TX increment is
+      # needed here — each frame already carries OEM_current + 1, the exact next
+      # value the EPS expects.
       # Lateral control type: sunnypilot FiskerLateralType toggle. Flag set = LCA/TJA
       # (Typ=3), flag clear = LKA (Typ=1, baseline). The Ocean's EPS has historically
       # only honoured LKA, so defaulting to 1 keeps the port working.
