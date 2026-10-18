@@ -51,11 +51,20 @@ class CarController(CarControllerBase):
     # Reset counter (0x20) increments, then +1 per 100 Hz frame (reaching ~101 before the
     # next Reset ~1 s later). Only the low 6 bits appear on the wire (SSecOC_Fresh_Byte0);
     # the MAC authenticates the full 64-bit freshness. The EPS reconstructs this window
-    # index for anti-replay, so we must reproduce it exactly. We do NOT free-run our own
-    # copy (that drifts out of the EPS's reconstruction window); instead we mirror OEM's
-    # reconstructed full counter from carstate each tick (see update()). 0x1D0 and 0x121
-    # are both 100 Hz and restart on the same boundary, so they share the index value.
+    # index for anti-replay, so we must reproduce it exactly.
+    #
+    # Counter policy (confirmed on-vehicle 2026-10-19, user's model): SNAP ONCE at the
+    # block moment to OEM's reconstructed full counter + 1, then free-run +1 per tick.
+    # We become OEM's exact continuation: at the first TX, OEM just delivered counter N
+    # to the EPS, we send N+1; we then march in lockstep with OEM's (now-blocked) bus-2
+    # stream, so at disengage OEM resumes at our_last + 1 — clean handoff both ways.
+    # Snap-once (not continuous-mirror) is essential: mirroring OEM every tick emits a
+    # DUPLICATE whenever our 100 Hz read phase catches the same OEM frame twice, which
+    # the EPS rejects. Re-snap on a GW Reset boundary (counter restarts there). 0x1D0 and
+    # 0x121 share the index (same 100 Hz restart), so the longitudinal path uses it too.
     self.secoc_window_ctr = 0
+    self.was_tx_secoc_prev = False  # rising edge of "transmitting any SecOC PDU" -> re-seed counter
+    self.secoc_reset_prev = None    # detect GW Reset change while transmitting -> re-seed
 
     self.secoc_key_verified = False
     self.secoc_warn_logged = False
@@ -77,9 +86,8 @@ class CarController(CarControllerBase):
     # (EPS rejects duplicates in the E2E monotonic check).
     self.alive_1d0 = 0
     self.alive_1c0 = 0
-    self.last_sent_alive_1d0 = -1   # invalid sentinel — force initialization at engage
-    self.last_sent_alive_1c0 = -1
-    self.was_lat_engaged_prev = False  # tracks lat_engaged (MADS) rising edge for OEM-counter seeding
+    self.was_lat_engaged_prev = False   # tracks lat_engaged (MADS) rising edge for engage delay
+    self.was_tx_lateral_prev = False    # rising edge of lateral TX -> snap alive counters from OEM
 
     # ICC 0x52A spoof: emit ONE frame per OEM tick (detected by AliveCounter change).
     # ICC broadcasts at ~10 Hz while we control at 100 Hz, so a naive tx-every-tick
@@ -190,31 +198,8 @@ class CarController(CarControllerBase):
     secoc_ok = self.CP.secOcKeyAvailable and self.secoc_key_verified
     trip, reset = CS.secoc_trip, CS.secoc_reset
 
-    # Maintain the per-Reset-window SecOC frame index (see __init__). It free-runs at the
-    # 100 Hz control rate and restarts on every GW Reset change, so at engagement it
-    # already matches the OEM/EPS window position: the first injected 0x1D0 is accepted
-    # and every subsequent window stays in lockstep (both restart at 1 on each boundary).
-    # SecOC msg counter: mirror OEM's authoritative FULL counter (reconstructed in
-    # carstate from the 6 wire bits + wrap tracking) and add 1 — the next value the
-    # EPS expects. OEM's counter is a real-time, per-reset-window index; mirroring it
-    # keeps our injected freshness aligned with the EPS's clock-based reconstruction
-    # (high bits included) on every frame, so the MAC validates for the whole
-    # engagement. The previous free-running counter (seeded once at engage) drifted
-    # out of the EPS's reconstruction window and made the MAC fail intermittently a
-    # few frames in — EPS would go Active then fault abort=8 depending on where in
-    # the window we engaged (on-vehicle 2026-10-19). OEM 0x1D0 and 0x121 share this
-    # per-window index (same 100 Hz restart boundary), so the longitudinal path uses
-    # the same value.
-    self.secoc_window_ctr = int(CS.oem_1d0_secoc_full_ctr) + 1
-
-    # E2E AliveCounters for the lateral PDUs: mirror OEM's current value + 1 (the
-    # next value the EPS expects) every tick, same principle as the SecOC counter
-    # above. Mirroring OEM's authoritative, real-time counter — rather than
-    # free-running our own seeded copy — keeps us aligned with the EPS across any
-    # control-loop jitter and across the 15-count wrap. OEM 0x1D0 and 0x1C0 have
-    # independent alive counters, so track each from its own source.
-    self.alive_1d0 = (int(CS.oem_1d0_alive) + 1) % 15
-    self.alive_1c0 = (int(CS.oem_1c0_alive) + 1) % 15
+    # SecOC + alive counters are seeded-once-at-block then free-run — see the block
+    # right before the lateral TX below (and __init__ for the policy rationale).
 
     # E2E AliveCounter (byte1 low nibble): 0..14 counter, +1 per frame, never 15 (15 is
     # the E2E invalid sentinel — DBC range [0|14]). For LATERAL (0x1D0/0x1C0) we track
@@ -340,11 +325,40 @@ class CarController(CarControllerBase):
     self.was_lat_engaged_prev = lat_engaged
     tx_lateral = (lat_engaged and self.engage_delay_remaining == 0) or in_fade
 
+    # ---- SecOC + alive counter: seed once at the block moment, then free-run +1 ----
+    # We become OEM's exact continuation. On the first TX after an idle gap (the
+    # "block moment", i.e. when the panda relay starts stealing OEM's frames), snap
+    # to OEM's reconstructed full counter + 1: OEM just delivered N to the EPS, so we
+    # send N+1. Then free-run +1 per tick, marching in lockstep with OEM's now-blocked
+    # bus-2 stream — so at disengage OEM resumes at our_last + 1, never a repeat. Snap
+    # ONCE (not every tick): re-reading OEM continuously emits a duplicate whenever our
+    # 100 Hz read phase lands on the same OEM frame twice, which the EPS rejects
+    # (on-vehicle 2026-10-19: continuous-mirror produced STEP-0 duplicates and faulted).
+    # Re-snap on a GW Reset boundary — the per-window index restarts there.
+    long_txing = self.CP.openpilotLongitudinalControl and (engaged or self.long_ever_active)
+    txing_secoc = tx_lateral or long_txing
+    if txing_secoc:
+      if (not self.was_tx_secoc_prev) or (reset != self.secoc_reset_prev):
+        self.secoc_window_ctr = int(CS.oem_1d0_secoc_full_ctr) + 1
+      else:
+        self.secoc_window_ctr += 1
+      self.secoc_reset_prev = reset
+    self.was_tx_secoc_prev = txing_secoc
+
+    # Lateral E2E alive counters (0x1D0 / 0x1C0): same seed-once-then-+1, from each
+    # PDU's own OEM source. These are independent 4-bit counters that do NOT restart
+    # on a GW Reset, so no reset re-seed — just wrap mod 15.
     if tx_lateral:
-      # alive_1d0/1c0 and secoc_window_ctr were already set at the top of update()
-      # by mirroring OEM's authoritative counters (+1), so no per-TX increment is
-      # needed here — each frame already carries OEM_current + 1, the exact next
-      # value the EPS expects.
+      if not self.was_tx_lateral_prev:
+        self.alive_1d0 = (int(CS.oem_1d0_alive) + 1) % 15
+        self.alive_1c0 = (int(CS.oem_1c0_alive) + 1) % 15
+      else:
+        self.alive_1d0 = (self.alive_1d0 + 1) % 15
+        self.alive_1c0 = (self.alive_1c0 + 1) % 15
+    self.was_tx_lateral_prev = tx_lateral
+
+    if tx_lateral:
+      # Counters (alive_1d0/1c0, secoc_window_ctr) were seeded/incremented just above.
       # Lateral control type: sunnypilot FiskerLateralType toggle. Flag set = LCA/TJA
       # (Typ=3), flag clear = LKA (Typ=1, baseline). The Ocean's EPS has historically
       # only honoured LKA, so defaulting to 1 keeps the port working.
