@@ -101,6 +101,20 @@ class CarController(CarControllerBase):
     self.lat_fade_remaining = 0
     self.FADE_TICKS = 50
 
+    # Engagement delay: wait this many ticks after lat_engaged rising edge
+    # before we start TX'ing. Between our carstate's OEM-counter snapshot
+    # and our first TX arriving at EPS, OEM can send one more 0x1D0 frame
+    # on bus 2 that panda forwards to bus 0 (panda's lateral relay only
+    # activates after our FIRST TX). If that OEM frame beats our TX to EPS,
+    # EPS's last-accepted counter == our TX counter → duplicate → abort=8.
+    # Observed on-vehicle 2026-10-18: EPS went Active then faulted 18 ms
+    # later with no state change on our side, matching this race.
+    # 2 ticks (20 ms) is comfortably longer than one OEM 10 ms frame-period
+    # so we're guaranteed to have observed OEM's post-engage counter before
+    # we TX; we re-snap each tick during the delay to track the latest.
+    self.engage_delay_remaining = 0
+    self.ENGAGE_DELAY_TICKS = 2
+
     # Phone-over-wifi remote-control state. Lazy-init'd on first update() tick
     # so the opendbc test harness (which has no libparams_c on macOS) can
     # instantiate CarController without blowing up. See REMOTE_* constants.
@@ -290,44 +304,38 @@ class CarController(CarControllerBase):
     # ahead of OEM — if we did and MADS later rose, our first TX would be out-of-sync
     # with OEM's current value by however many ticks the ACC-only window lasted.
     if lat_engaged and not self.was_lat_engaged_prev:
-      # Rising edge: seed our alive counter so that AFTER the standard per-tick
-      # increment below, our first-TX alive = (OEM_last + 1) — i.e. the NEXT value
-      # OEM would have sent, which is what the EPS is expecting next. CS.oem_1d0_alive
-      # is the LAST observed OEM counter; EPS has already processed it, so sending the
-      # same value is a duplicate and gets rejected (abort=8 CAN on 0x1C2, seen in the
-      # on-vehicle trace at 8.375s = 30 ms after our first Req=1 frame hit the EPS).
-      #
-      # Seed to OEM_last so (+1 per-tick) gives first-TX = OEM_last + 1 = EPS-expected.
-      #
-      # Disengage math still clean: after N ticks our last-sent = OEM_last+N, OEM's own
-      # counter has also advanced to OEM_last+N (both 100 Hz lockstep), OEM's next TX =
-      # OEM_last+N+1 = exactly our_last+1 that EPS is now expecting. No duplicate, no
-      # jump, no fault on either edge.
+      # Rising edge: start the engage-delay window. During the delay we DO NOT
+      # TX; we just re-snap OEM counters each tick so by the time we start
+      # transmitting, we're using OEM's latest observed values — eliminating
+      # the duplicate-counter race against OEM frames that reach the EPS
+      # before our panda relay engages.
+      self.engage_delay_remaining = self.ENGAGE_DELAY_TICKS
+    if lat_engaged and self.engage_delay_remaining > 0:
+      # During the delay, refresh our seeds from the latest carstate every tick.
+      # After the standard +1 per-tick increment that fires when we DO start
+      # transmitting, our first-TX counter will equal (observed_oem + 1) which
+      # is exactly what EPS expects next.
       self.alive_1d0 = int(CS.oem_1d0_alive) % 15
       self.alive_1c0 = int(CS.oem_1c0_alive) % 15
-      # SecOC msg counter: same +1 fix for the wire counter. Snap low 6 bits to
-      # (OEM_wire + 1) % 64 so our first TX carries msg_counter = OEM_wire+1 (next
-      # expected). secoc_window_ctr already got its per-tick increment earlier in
-      # this update and won't change again this tick, so the snap IS the first-TX
-      # value for the low bits. High bits stay from the free-running counter, which
-      # has been counting from GW Reset in lockstep with OEM so they already match.
-      self.secoc_window_ctr = (self.secoc_window_ctr & ~0x3F) | ((int(CS.oem_1d0_secoc_wire_ctr) + 1) & 0x3F)
+      # SecOC msg counter: snap low 6 bits to OEM_wire (not +1 — the per-tick
+      # increment that happens on the first TX tick will add the +1). High
+      # bits stay from the free-running counter.
+      self.secoc_window_ctr = (self.secoc_window_ctr & ~0x3F) | (int(CS.oem_1d0_secoc_wire_ctr) & 0x3F)
+      self.engage_delay_remaining -= 1
     # Fade-out window: on lat_engaged falling edge we extend the TX window by FADE_TICKS
     # so the EPS keeps receiving our Req=0 stream for a beat after disengage. During
     # fade: panda's time-based lateral relay keeps blocking OEM 0x1D0/0x1C0, the EPS
     # 0x1C2 spoof keeps running (OEM ADAS still sees EPS=Available), and the EPS
     # transitions Active→Available smoothly off our commands rather than off a sudden
-    # OEM-command injection. Smooths the handoff and prevents the "LKA not available"
-    # flash that was coming from the OEM ADAS consistency check firing on EPS state
-    # changes it didn't ask for.
+    # OEM-command injection. The 0x1C0 wire fields during fade keep Sts=1/Typ=1 (we
+    # haven't "left") and only drop Req to 0 — observed on-vehicle 2026-10-18 that
+    # slamming Sts/Typ to 0 at disengage caused EPS abort=8 the same way the mid-
+    # engage driver-override transition did.
     if lat_engaged:
       self.lat_fade_remaining = self.FADE_TICKS
-    elif self.was_lat_engaged_prev:
-      # Falling edge: fade timer was already reset above on rising, now kick it off
-      # (it was reset to FADE_TICKS during the last engaged tick, so no reset needed).
-      pass
     self.was_lat_engaged_prev = lat_engaged
-    tx_lateral = lat_engaged or (self.lat_fade_remaining > 0)
+    # TX only after engage-delay elapses; keep TXing during fade.
+    tx_lateral = (lat_engaged and self.engage_delay_remaining == 0) or (self.lat_fade_remaining > 0)
     if not lat_engaged and self.lat_fade_remaining > 0:
       self.lat_fade_remaining -= 1
 
@@ -349,23 +357,19 @@ class CarController(CarControllerBase):
       lat_ctrl_typ = 3 if (self.CP_SP.flags & FiskerFlagsSP.LAT_CTRL_LCA.value) else 1
       # Two independent wire bits (see create_lat_control docstring for the full why):
       #   * `lat_engaged_wire` — are we in an engaged lateral session? Drives
-      #     Sts/Typ/ReqVld. Stable True across driver-override transients, only
-      #     drops at MADS release / during fade.
+      #     Sts/Typ/ReqVld. Stable True across driver-override transients AND
+      #     across the fade-out window — only drops once the fade has actually
+      #     elapsed and we're about to stop transmitting entirely.
       #   * `lat_active_wire`  — on this tick, are we actively servoing the angle
       #     or backing off for the driver? Drives Req only.
       #
-      # Observed on-vehicle 2026-10-18: ~100 ms after a clean engage, the first
-      # driver-torque pulse flipped MADS → `overriding` → carControl.latActive=False.
-      # The old `effective_lat_active = lat_active and lat_engaged` scheme slammed
-      # Sts/Typ/Req all three to 0 on that tick, which the EPS treated as a
-      # protocol violation and raised abort=8 (CAN), state=3 (Failure).
-      # Splitting the bits so Sts/Typ stay 1 while only Req drops to 0 keeps the
-      # EPS in Active state through driver overrides.
-      #
-      # During the fade window (lat_engaged=False, fade>0) we want the EPS to
-      # cleanly release — so both bits go False and we TX a frame that looks like
-      # the OEM's inactive default.
-      lat_engaged_wire = lat_engaged
+      # Both faults observed on-vehicle 2026-10-18 came from slamming Sts/Typ
+      # to 0 while EPS was still in state Active: once on the first driver-
+      # torque pulse (carControl.latActive dropped), once on MADS release
+      # (lat_engaged dropped and the old fade code TX'd Sts=0/Typ=0). Splitting
+      # the bits so Sts/Typ stay 1 while only Req follows lat_active keeps the
+      # EPS in Active state right up to the moment we actually stop transmitting.
+      lat_engaged_wire = lat_engaged or (self.lat_fade_remaining > 0)
       lat_active_wire = lat_active and lat_engaged
       steer_msg = self.fcan.create_steering_control(self.apply_angle_last, self.alive_1d0)
       can_sends.append(self._stamp(steer_msg, STEER_CAN_ID, trip, reset, self.secoc_window_ctr))
