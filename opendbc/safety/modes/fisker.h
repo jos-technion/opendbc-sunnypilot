@@ -320,6 +320,24 @@ static bool fisker_fwd_hook(int bus_num, int addr) {
     if ((addr == 0x52A) && fisker_icc_relay_active()) {
       block_msg = true;
     }
+    // Keep openpilot's injected actuator frames OFF the OEM ADAS module's bus.
+    // ADAS_0x1D0/0x1C0 (and the longitudinal 0x121/0x117/0x118) are authored BY
+    // the ADAS module; in stock operation they only ever travel ADAS(bus2) ->
+    // vehicle(bus0). openpilot injects its own copies on bus 0 to drive the EPS/VCU
+    // directly. Panda's default bus0->bus2 forwarding reflects those injections back
+    // to the OEM ADAS, which then sees a SECOND sender of its own message IDs and
+    // logs a DTC — observed on-vehicle 2026-10-19 as ADAS_Sts_ACC_ICC going to the
+    // fault state and staying there until an ignition cycle. Blocking is safe
+    // UNCONDITIONALLY: nothing on bus 0 legitimately originates these IDs, so the
+    // only bus0->bus2 copy that ever exists is openpilot's own injection. (EPS_*,
+    // VCU_*, wheel-speed etc. still forward bus0->bus2 normally so the ADAS keeps
+    // sensing vehicle state.)
+    if ((addr == 0x1D0) || (addr == 0x1C0)) {
+      block_msg = true;
+    }
+    if (fisker_longitudinal && ((addr == 0x121) || (addr == 0x117) || (addr == 0x118))) {
+      block_msg = true;
+    }
     // (EPS_0x1C2 block disabled — see fiskercan.py / carcontroller.py comments.)
   }
   return block_msg;
