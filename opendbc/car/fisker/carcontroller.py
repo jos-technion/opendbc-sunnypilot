@@ -312,15 +312,21 @@ class CarController(CarControllerBase):
       self.engage_delay_remaining = self.ENGAGE_DELAY_TICKS
     if lat_engaged and self.engage_delay_remaining > 0:
       # During the delay, refresh our seeds from the latest carstate every tick.
-      # After the standard +1 per-tick increment that fires when we DO start
-      # transmitting, our first-TX counter will equal (observed_oem + 1) which
-      # is exactly what EPS expects next.
+      # alive_1d0/1c0: snap to OEM-current. The TX block's `+1 per tick`
+      # increment turns this into OEM-current+1 at TX time, which is the next
+      # value EPS expects.
       self.alive_1d0 = int(CS.oem_1d0_alive) % 15
       self.alive_1c0 = int(CS.oem_1c0_alive) % 15
-      # SecOC msg counter: snap low 6 bits to OEM_wire (not +1 — the per-tick
-      # increment that happens on the first TX tick will add the +1). High
-      # bits stay from the free-running counter.
-      self.secoc_window_ctr = (self.secoc_window_ctr & ~0x3F) | (int(CS.oem_1d0_secoc_wire_ctr) & 0x3F)
+      # SecOC wire counter: snap to OEM_wire + 1. Unlike alive_1d0, there is
+      # NO +1 per-TX increment on the SecOC counter — the per-tick increment
+      # that applies here is the pre-tick `secoc_window_ctr += 1` at the top
+      # of update() which runs BEFORE this snap, so our snap overwrites it.
+      # If we snapped to OEM_wire (no +1) our first TX would carry SecOC wire
+      # = OEM_wire = EPS's last-accepted value = duplicate → abort=8.
+      # Observed on-vehicle 2026-10-18 (south-button engagement, 101 ms after
+      # EPS went Active). The alive counter has its own TX-time +1 and did
+      # not suffer the same bug, so the fault was specifically SecOC-side.
+      self.secoc_window_ctr = (self.secoc_window_ctr & ~0x3F) | ((int(CS.oem_1d0_secoc_wire_ctr) + 1) & 0x3F)
       self.engage_delay_remaining -= 1
     # Fade-out window: on lat_engaged falling edge we extend the TX window by FADE_TICKS
     # so the EPS keeps receiving our Req=0 stream for a beat after disengage. During
