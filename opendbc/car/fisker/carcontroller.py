@@ -316,16 +316,24 @@ class CarController(CarControllerBase):
       # value EPS expects.
       self.alive_1d0 = int(CS.oem_1d0_alive) % 15
       self.alive_1c0 = int(CS.oem_1c0_alive) % 15
-      # SecOC wire counter: snap to OEM_wire + 1. Unlike alive_1d0, there is
-      # NO +1 per-TX increment on the SecOC counter — the per-tick increment
-      # that applies here is the pre-tick `secoc_window_ctr += 1` at the top
-      # of update() which runs BEFORE this snap, so our snap overwrites it.
-      # If we snapped to OEM_wire (no +1) our first TX would carry SecOC wire
-      # = OEM_wire = EPS's last-accepted value = duplicate → abort=8.
-      # Observed on-vehicle 2026-10-18 (south-button engagement, 101 ms after
-      # EPS went Active). The alive counter has its own TX-time +1 and did
-      # not suffer the same bug, so the fault was specifically SecOC-side.
-      self.secoc_window_ctr = (self.secoc_window_ctr & ~0x3F) | ((int(CS.oem_1d0_secoc_wire_ctr) + 1) & 0x3F)
+      # SecOC wire counter: snap to OEM_wire (NO +1 here). The pre-tick
+      # `secoc_window_ctr += 1` at the top of update() runs on EVERY tick,
+      # including the first TX tick after the delay elapses. So on that TX
+      # tick, pre-tick adds +1 to whatever we snapped — bringing low bits to
+      # (OEM_wire + 1), which is exactly what EPS expects next.
+      #
+      # The ORIGINAL (no-delay) design used `OEM_wire + 1` in the snap,
+      # correctly, because snap and TX happened on the SAME tick: pre-tick
+      # ran, snap OVERWROTE to OEM_wire+1, TX used that. In this delay
+      # design the snap-ticks and TX-tick are different, so the pre-tick
+      # between them adds a second +1 if we don't correct here.
+      #
+      # Observed on-vehicle 2026-10-19 (south-button engagement, EPS went
+      # Active then faulted ~100 ms later with abort=8): every TX during
+      # engagement was +1 ahead of EPS's expected counter, so EPS marked
+      # each as a "skip-by-1". After ~5 frames of consistently-skipped
+      # counters EPS gave up and raised abort=8 (CAN).
+      self.secoc_window_ctr = (self.secoc_window_ctr & ~0x3F) | (int(CS.oem_1d0_secoc_wire_ctr) & 0x3F)
       self.engage_delay_remaining -= 1
     # Fade-out window: on lat_engaged falling edge we extend the TX window by FADE_TICKS
     # so the EPS keeps receiving our Req=0 stream for a beat after disengage. During
