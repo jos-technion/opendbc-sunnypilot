@@ -107,13 +107,12 @@ class CarController(CarControllerBase):
     # on bus 2 that panda forwards to bus 0 (panda's lateral relay only
     # activates after our FIRST TX). If that OEM frame beats our TX to EPS,
     # EPS's last-accepted counter == our TX counter → duplicate → abort=8.
-    # Observed on-vehicle 2026-10-18: EPS went Active then faulted 18 ms
-    # later with no state change on our side, matching this race.
-    # 2 ticks (20 ms) is comfortably longer than one OEM 10 ms frame-period
-    # so we're guaranteed to have observed OEM's post-engage counter before
-    # we TX; we re-snap each tick during the delay to track the latest.
+    # We re-snap each tick during the delay to track OEM's latest wire value.
+    # 5 ticks (50 ms) is well beyond any plausible pandad/USB jitter window
+    # and ~5x the OEM frame period, so we're guaranteed to have observed
+    # OEM's post-engage counter at least a few times before we TX.
     self.engage_delay_remaining = 0
-    self.ENGAGE_DELAY_TICKS = 2
+    self.ENGAGE_DELAY_TICKS = 5
 
     # Phone-over-wifi remote-control state. Lazy-init'd on first update() tick
     # so the opendbc test harness (which has no libparams_c on macOS) can
