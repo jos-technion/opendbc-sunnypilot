@@ -344,13 +344,25 @@ class CarController(CarControllerBase):
     # haven't "left") and only drop Req to 0 — observed on-vehicle 2026-10-18 that
     # slamming Sts/Typ to 0 at disengage caused EPS abort=8 the same way the mid-
     # engage driver-override transition did.
+    # Fade is PRIMED (reset to FADE_TICKS) on every engaged tick so that the
+    # moment we disengage it's already full. It's CONSUMED (counted down)
+    # only when not engaged. The subtle part: `tx_lateral` must only treat
+    # the fade as "active" during the post-disengage window — never during
+    # engagement — otherwise priming the fade on the rising edge immediately
+    # satisfies the TX gate and we bypass the engage delay. That's exactly
+    # what showed up on-vehicle 2026-10-19: first TX was happening ~15 ms
+    # into engagement (one tick) instead of ~50 ms (after the 5-tick delay),
+    # which bypassed the OEM-counter settle and let the first few SecOC
+    # frames go out with a counter the EPS hadn't caught up to yet.
     if lat_engaged:
       self.lat_fade_remaining = self.FADE_TICKS
+      in_fade = False
+    else:
+      in_fade = self.lat_fade_remaining > 0
+      if in_fade:
+        self.lat_fade_remaining -= 1
     self.was_lat_engaged_prev = lat_engaged
-    # TX only after engage-delay elapses; keep TXing during fade.
-    tx_lateral = (lat_engaged and self.engage_delay_remaining == 0) or (self.lat_fade_remaining > 0)
-    if not lat_engaged and self.lat_fade_remaining > 0:
-      self.lat_fade_remaining -= 1
+    tx_lateral = (lat_engaged and self.engage_delay_remaining == 0) or in_fade
 
     if tx_lateral:
       # Per-tick increment: alive matches OEM's tick rate exactly (both 100 Hz) so we
