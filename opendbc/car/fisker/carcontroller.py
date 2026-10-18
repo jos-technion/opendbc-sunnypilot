@@ -336,19 +336,26 @@ class CarController(CarControllerBase):
     # the EPS rejects (on-vehicle 2026-10-19: continuous-mirror produced STEP-0
     # duplicates).
     #
-    # Re-snap on a GW reset too. The MAC's high bits are a per-reset-window count that
-    # the EPS zeroes each ~1 Hz GW reset (see carstate), so our free-run must re-align
-    # to OEM's post-reset value or every subsequent MAC fails. Re-snapping to
-    # oem_full + 1 on the reset change does that. (Residual: our carstate observes the
-    # reset ~cereal-lag after the EPS sees it on-bus, so a few frames during that window
-    # still carry the pre-reset counter and fail — this is the one handoff the userspace
-    # path can't make atomic; the real fix is panda-side SecOC stamping, which sees the
-    # reset at bus speed. See notes.)
+    # GW reset handling. On-vehicle 2026-10-19 (OEM-vs-ours CMP instrumentation)
+    # showed exactly what the counter does at a ~1 Hz GW reset: the per-window HIGH
+    # bits restart to 0, but the 6-bit WIRE value is CONTINUOUS — OEM's wire stepped
+    # 37->38 straight through the reset, it did not drop. So at the reset we advance
+    # +1 and zero ONLY the high bits (& 0x3F), keeping the low 6 bits continuous.
+    #
+    # The previous code re-snapped the WHOLE counter from carstate's oem_full at the
+    # reset; because oem_full's low bits are cereal-lagged (~25 counts behind OEM's
+    # actual bus-2 wire at that instant), that yanked our wire value backward ~25 —
+    # the EPS saw a replay and aborted (abort=8). Keeping the low bits free-running
+    # avoids the backward jump entirely.
     long_txing = self.CP.openpilotLongitudinalControl and (engaged or self.long_ever_active)
     txing_secoc = tx_lateral or long_txing
     if txing_secoc:
-      if (not self.was_tx_secoc_prev) or (reset != self.secoc_reset_prev):
+      if not self.was_tx_secoc_prev:
+        # Block moment: seed the full per-window counter from OEM's current value.
         self.secoc_window_ctr = int(CS.oem_1d0_secoc_full_ctr) + 1
+      elif reset != self.secoc_reset_prev:
+        # GW reset: advance the wire counter but restart the per-window high bits.
+        self.secoc_window_ctr = (self.secoc_window_ctr + 1) & 0x3F
       else:
         self.secoc_window_ctr += 1
       self.secoc_reset_prev = reset
