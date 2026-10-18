@@ -347,24 +347,32 @@ class CarController(CarControllerBase):
       # (Typ=3), flag clear = LKA (Typ=1, baseline). The Ocean's EPS has historically
       # only honoured LKA, so defaulting to 1 keeps the port working.
       lat_ctrl_typ = 3 if (self.CP_SP.flags & FiskerFlagsSP.LAT_CTRL_LCA.value) else 1
-      # During the fade window lat_engaged is False → force the wire content to
-      # inactive (Req=0, Sts=0, Typ=0) regardless of what CC.latActive says, so the
-      # EPS releases immediately. apply_angle_last was already mirrored to the measured
-      # angle up above (apply_std_steer_angle_limits with lat_active=False returns the
-      # measured angle), so 0x1D0 just carries the current wheel position.
-      effective_lat_active = lat_active and lat_engaged
+      # Two independent wire bits (see create_lat_control docstring for the full why):
+      #   * `lat_engaged_wire` — are we in an engaged lateral session? Drives
+      #     Sts/Typ/ReqVld. Stable True across driver-override transients, only
+      #     drops at MADS release / during fade.
+      #   * `lat_active_wire`  — on this tick, are we actively servoing the angle
+      #     or backing off for the driver? Drives Req only.
+      #
+      # Observed on-vehicle 2026-10-18: ~100 ms after a clean engage, the first
+      # driver-torque pulse flipped MADS → `overriding` → carControl.latActive=False.
+      # The old `effective_lat_active = lat_active and lat_engaged` scheme slammed
+      # Sts/Typ/Req all three to 0 on that tick, which the EPS treated as a
+      # protocol violation and raised abort=8 (CAN), state=3 (Failure).
+      # Splitting the bits so Sts/Typ stay 1 while only Req drops to 0 keeps the
+      # EPS in Active state through driver overrides.
+      #
+      # During the fade window (lat_engaged=False, fade>0) we want the EPS to
+      # cleanly release — so both bits go False and we TX a frame that looks like
+      # the OEM's inactive default.
+      lat_engaged_wire = lat_engaged
+      lat_active_wire = lat_active and lat_engaged
       steer_msg = self.fcan.create_steering_control(self.apply_angle_last, self.alive_1d0)
       can_sends.append(self._stamp(steer_msg, STEER_CAN_ID, trip, reset, self.secoc_window_ctr))
-      # Also assert driver_override on the wire when the EPS tells us the driver is
-      # overpowering (same conservative signal that drives the Req=0 release above).
-      # DBC lists ADAS_LatCtrl_DrvrOvrd as GW-only (receivers=[GW]) so the EPS is not
-      # spec'd to read it, but firmware sometimes reads what the DBC says it shouldn't
-      # — zero cost to flip the bit and see if it affects the EPS's internal
-      # counter-torque gain. The Req=0 release is the actual override mechanism; this
-      # bit is just a bonus signal.
-      can_sends.append(self.fcan.create_lat_control(effective_lat_active, self.alive_1c0,
+      can_sends.append(self.fcan.create_lat_control(lat_active_wire, self.alive_1c0,
                                                     driver_override=CS.driver_intervening,
-                                                    lat_ctrl_typ=lat_ctrl_typ))
+                                                    lat_ctrl_typ=lat_ctrl_typ,
+                                                    lat_engaged=lat_engaged_wire))
 
       # EPS_0x1C2 spoof: DISABLED. On-vehicle testing with the verified checksum
       # algorithm (CRC-8 J1850, data_id=0x90) STILL caused ADAS errors in MADS and

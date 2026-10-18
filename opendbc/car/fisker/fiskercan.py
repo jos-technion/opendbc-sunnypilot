@@ -106,18 +106,25 @@ class FiskerCAN:
     return addr, bytes([chk]) + data[1:], bus
 
   def create_lat_control(self, lat_active: bool, counter: int, driver_override: bool = False,
-                         lat_ctrl_typ: int = 1):
+                         lat_ctrl_typ: int = 1, lat_engaged: bool | None = None):
     """ADAS_0x1C0 — lateral-control activation/status, 10 ms cycle (plain E2E checksum,
     no SecOC).
 
-    Sent for the full engaged window (not only while lat_active) so the cluster never sees
-    the frame disappear. The content mirrors the OEM's semantics:
-      * lat_active True  -> Sts=1, Req=1, Typ=lat_ctrl_typ (active, requesting the 0x1D0 angle)
-      * lat_active False -> Sts=0, Req=0, Typ=0 (inactive, i.e. the OEM's default frame)
-    This way, when the driver overrides and lat_active drops, the EPS gets a fresh Req=0
-    on the very next 10 ms cycle and releases -- unlike the previous design that stopped
-    sending 0x1C0 altogether, which left the EPS servoing the last commanded angle for a
-    beat and made the wheel very hard to move.
+    Two independent bits here:
+      * `lat_engaged` — are we in an engaged lateral session (MADS armed, SecOC up,
+        the whole 0x1D0/0x1C0 stream flowing)? Drives Sts/StsVld/Typ/ReqVld.
+      * `lat_active`  — on *this* tick, are we actively servoing an angle (True), or
+        backing off because the driver has their hand on the wheel (False)? Drives Req only.
+
+    Only Req changes on driver-override transitions. The EPS wants a stable
+    "we're still engaged" signal (Sts=Active, Typ=LKA, StsVld=Valid) while Req
+    toggles 1↔0; it treats a sudden Sts=Active→Inactive (with Typ dropping
+    from LKA→Not_active) as a protocol violation and raises abort=8 (CAN) /
+    state=3 (Failure). Observed on-vehicle 2026-10-18: within ~100 ms of a
+    clean engage, the first driver-torque pulse flipped MADS to `overriding`
+    → carControl.latActive=False → old code slammed all three to 0 → EPS fault.
+
+    For backwards-compat, `lat_engaged=None` falls back to `lat_active` (old behaviour).
 
     ADAS_LatCtrl_Typ selects the lateral-control type the EPS runs. DBC values:
       1=LKA_angle_request (default — the Ocean's EPS historically only honours this)
@@ -132,14 +139,16 @@ class FiskerCAN:
     receiver list = GW). The EPS does NOT read it; it uses its own driver-torque sensor
     (EPS_DrvrSteerTq/EPS_DrvrIntvSteerWhlDetd on 0x1C4). Setting DrvrOvrd here is purely
     informational for the GW log."""
+    if lat_engaged is None:
+      lat_engaged = lat_active
     values = {
-      "ADAS_LatCtrl_Sts": 1 if lat_active else 0,              # 0=Inactive 1=Active
-      "ADAS_LatCtrl_StsVld": 1,                                 # 1=Valid
-      "ADAS_LatCtrl_DrvrOvrd": 1 if driver_override else 0,     # GW-only diagnostic
-      "ADAS_LatCtrl_DrvrOvrdVld": 1,                            # 1=Valid
-      "ADAS_LatCtrl_Typ": lat_ctrl_typ if lat_active else 0,    # 1=LKA, 3=LCA_or_TJA, 0=Not_active
-      "ADAS_LatCtrl_ReqVld": 1 if lat_active else 0,            # 1=Steering_angle_request_valid
-      "ADAS_LatCtrl_Req": 1 if lat_active else 0,               # 1=Angle_request_active -> EPS servoes
+      "ADAS_LatCtrl_Sts": 1 if lat_engaged else 0,              # 0=Inactive 1=Active (engaged session)
+      "ADAS_LatCtrl_StsVld": 1,                                  # 1=Valid
+      "ADAS_LatCtrl_DrvrOvrd": 1 if driver_override else 0,      # GW-only diagnostic
+      "ADAS_LatCtrl_DrvrOvrdVld": 1,                             # 1=Valid
+      "ADAS_LatCtrl_Typ": lat_ctrl_typ if lat_engaged else 0,    # 1=LKA, 3=LCA_or_TJA, 0=Not_active
+      "ADAS_LatCtrl_ReqVld": 1 if lat_engaged else 0,            # Req is "valid to interpret" as long as we're engaged
+      "ADAS_LatCtrl_Req": 1 if lat_active else 0,                # 1=Angle_request_active -> EPS servoes
       "ADAS_1C0_AliveCounter": counter & 0xF,
       "ADAS_1C0_CheckSum": 0,   # filled below
     }
