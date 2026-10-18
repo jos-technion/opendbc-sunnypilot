@@ -42,13 +42,18 @@ static bool fisker_icc_relay_active(void) {
 // as-is in fiskercan.py for easy revival once we have reason to try again with a
 // multi-signal spoof. See the commented block at the spoof call site in carcontroller.py.)
 
-// Lateral TX relay (500 ms): carcontroller TXes 0x1D0/0x1C0 during MADS engagement AND
-// during the 500 ms post-disengage fade (Req=0 content), so the EPS transitions
-// Active→Available on OUR terms rather than from a surprise OEM command injection.
-// Panda uses this timestamp to block OEM 0x1D0/0x1C0 forwarding bus 2 → bus 0 for the
-// same window, keeping the EPS fed from exactly one source. Replaces the older
-// controls_allowed_lateral gate so fade is observed on both openpilot and panda sides.
-#define FISKER_LAT_RELAY_TIMEOUT_US 500000U
+// Lateral TX relay: while openpilot is injecting 0x1D0/0x1C0, panda blocks OEM's own
+// 0x1D0/0x1C0 from reaching the EPS (bus 2 → bus 0) so the EPS is fed from exactly one
+// source. The timestamp is refreshed on every injected frame, so the relay stays active
+// as long as we TX at 100 Hz (plus the short post-disengage fade). TIMEOUT sets how long
+// after our LAST frame the OEM stream resumes to the EPS — i.e. the disengage handoff
+// gap. It was 500 ms, which left the EPS unfed for up to ~500 ms after the fade ended
+// (OEM blocked the whole time) and could fault it on the gap. 60 ms = 6 control ticks:
+// long enough to ride out normal TX jitter during engagement (we never miss 6 ticks in
+// a row on the CAN-locked 100 Hz loop), short enough that OEM resumes almost immediately
+// after we stop — our counter is OEM's exact continuation, so OEM picks up at our_last+N
+// for a tiny N, never a backward/duplicate value (on-vehicle 2026-10-19 user request).
+#define FISKER_LAT_RELAY_TIMEOUT_US 60000U
 static uint32_t fisker_lat_tx_last = 0U;
 
 static bool fisker_lat_relay_active(void) {

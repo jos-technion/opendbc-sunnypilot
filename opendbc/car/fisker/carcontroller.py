@@ -63,8 +63,7 @@ class CarController(CarControllerBase):
     # the EPS rejects. Re-snap on a GW Reset boundary (counter restarts there). 0x1D0 and
     # 0x121 share the index (same 100 Hz restart), so the longitudinal path uses it too.
     self.secoc_window_ctr = 0
-    self.was_tx_secoc_prev = False  # rising edge of "transmitting any SecOC PDU" -> re-seed counter
-    self.secoc_reset_prev = None    # detect GW Reset change while transmitting -> re-seed
+    self.was_tx_secoc_prev = False  # rising edge of "transmitting any SecOC PDU" -> seed counter once
 
     self.secoc_key_verified = False
     self.secoc_warn_logged = False
@@ -99,14 +98,14 @@ class CarController(CarControllerBase):
 
     # Lateral fade-out: ticks remaining of post-disengage grace. On MADS falling edge
     # we extend the TX window by this many ticks so the EPS sees Req=0 for a beat
-    # and transitions Active→Available smoothly, before our stream fully drops.
-    # Panda matches via a time-based lateral relay (see fisker_lat_relay_active in
-    # fisker.h): OEM 0x1D0/0x1C0 stays blocked while we've TX'd recently. The EPS
-    # 0x1C2 spoof runs over the same tx_lateral window so the OEM ADAS sees
-    # EPS=Available throughout, no mismatch, no "LKA not available" flash.
-    # 50 ticks @ 100 Hz = 500 ms.
+    # and transitions Active→Available smoothly, before our stream fully drops. Then
+    # the panda lateral relay (60 ms) lets OEM resume to the EPS right after our last
+    # fade frame — our counter is OEM's exact continuation so OEM picks up at our_last+N
+    # with a tiny N (clean handoff). Keep the fade short: 10 ticks @ 100 Hz = 100 ms is
+    # plenty for the EPS to see Req=0 and release, and keeps the total post-disengage
+    # blackout (fade + relay) to ~160 ms instead of the old ~1 s. Was 50 (500 ms).
     self.lat_fade_remaining = 0
-    self.FADE_TICKS = 50
+    self.FADE_TICKS = 10
 
     # Engagement delay: wait this many ticks after lat_engaged rising edge
     # before we start TX'ing. Between our carstate's OEM-counter snapshot
@@ -329,20 +328,26 @@ class CarController(CarControllerBase):
     # We become OEM's exact continuation. On the first TX after an idle gap (the
     # "block moment", i.e. when the panda relay starts stealing OEM's frames), snap
     # to OEM's reconstructed full counter + 1: OEM just delivered N to the EPS, so we
-    # send N+1. Then free-run +1 per tick, marching in lockstep with OEM's now-blocked
-    # bus-2 stream — so at disengage OEM resumes at our_last + 1, never a repeat. Snap
-    # ONCE (not every tick): re-reading OEM continuously emits a duplicate whenever our
-    # 100 Hz read phase lands on the same OEM frame twice, which the EPS rejects
-    # (on-vehicle 2026-10-19: continuous-mirror produced STEP-0 duplicates and faulted).
-    # Re-snap on a GW Reset boundary — the per-window index restarts there.
+    # send N+1. Then free-run +1 per tick FOREVER (until we stop TXing), marching in
+    # lockstep with OEM's now-blocked bus-2 stream — so at disengage OEM resumes at
+    # our_last + 1, never a repeat. Snap ONCE (not every tick): re-reading OEM emits a
+    # duplicate whenever our 100 Hz read phase lands on the same OEM frame twice, which
+    # the EPS rejects (on-vehicle 2026-10-19: continuous-mirror produced STEP-0
+    # duplicates).
+    #
+    # Do NOT re-snap on a GW reset. The msg_counter is continuous across resets
+    # (verified on-vehicle: it stepped 37->38 through a reset, did not restart). The
+    # separate GW `reset` field rides into the wire byte + MAC from CS.secoc_reset on
+    # its own; it must not disturb our free-running msg_counter. An earlier version
+    # re-snapped on reset change and jolted the counter at the ~1 Hz reset boundary,
+    # faulting the EPS mid-engagement.
     long_txing = self.CP.openpilotLongitudinalControl and (engaged or self.long_ever_active)
     txing_secoc = tx_lateral or long_txing
     if txing_secoc:
-      if (not self.was_tx_secoc_prev) or (reset != self.secoc_reset_prev):
+      if not self.was_tx_secoc_prev:
         self.secoc_window_ctr = int(CS.oem_1d0_secoc_full_ctr) + 1
       else:
         self.secoc_window_ctr += 1
-      self.secoc_reset_prev = reset
     self.was_tx_secoc_prev = txing_secoc
 
     # Lateral E2E alive counters (0x1D0 / 0x1C0): same seed-once-then-+1, from each
