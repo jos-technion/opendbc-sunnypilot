@@ -143,6 +143,7 @@ class CarState(CarStateBase):
     self._oem_secoc_wraps = 0
     self._oem_secoc_wire_last = 0
     self._oem_secoc_reset_tracked = None
+    self._oem_secoc_rb_tracked = None
 
     # ICC_0x52A cached values. This is the ICC settings frame we spoof on bus 2 when
     # cruise is engaged: we forward every OEM signal untouched EXCEPT ICCACCFuncTyp
@@ -447,8 +448,16 @@ class CarState(CarStateBase):
     # bump it on each 6-bit wire wrap (63 -> 0) within the window. A wrap is any
     # decrease, caught as long as we never skip a full 64-frame span (we run at the
     # OEM's 100 Hz).
-    if self.secoc_reset != self._oem_secoc_reset_tracked:
-      self._oem_secoc_reset_tracked = self.secoc_reset
+    # Window restarts when OEM's OWN 0x1D0 reset bits (low 2 bits of Fresh_Byte0) flip, NOT when
+    # the GW sync (0x20) reset counter changes. OEM's flip trails the sync by ~10-21 ms. Keying the
+    # restart on the sync edge zeroed the wrap count one carstate tick before OEM's wire counter
+    # dropped back to ~1; that drop then looked like a 6-bit wrap, adding +64 to the full counter
+    # for the entire next window (MAC invalid at the EPS -> abort=8 ~50 ms later, whenever the
+    # sync/flip gap spanned two ticks). The wire reset bits and the wire counter flip in the same
+    # frame, so they cannot disagree.
+    cur_rb = int(oem_1d0["ADAS_1D0_SSecOC_Fresh_Byte0"]) & 0x3
+    if cur_rb != self._oem_secoc_rb_tracked:
+      self._oem_secoc_rb_tracked = cur_rb
       self._oem_secoc_wraps = 0
     elif cur_wire < self._oem_secoc_wire_last:
       self._oem_secoc_wraps += 1
