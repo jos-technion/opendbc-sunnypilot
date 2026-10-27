@@ -142,7 +142,7 @@ class CarState(CarStateBase):
     self.oem_1d0_secoc_full_ctr = 0
     self._oem_secoc_wraps = 0
     self._oem_secoc_wire_last = 0
-    self._oem_secoc_reset_tracked = None
+    self._oem_secoc_rflag_last = None
 
     # ICC_0x52A cached values. This is the ICC settings frame we spoof on bus 2 when
     # cruise is engaged: we forward every OEM signal untouched EXCEPT ICCACCFuncTyp
@@ -437,18 +437,25 @@ class CarState(CarStateBase):
     self.oem_1d0_alive = int(oem_1d0["ADAS_1D0_AliveCounter"])
     self.oem_1c0_alive = int(oem_1c0["ADAS_1C0_AliveCounter"])
     cur_wire = (int(oem_1d0["ADAS_1D0_SSecOC_Fresh_Byte0"]) >> 2) & 0x3F
+    cur_rflag = int(oem_1d0["ADAS_1D0_SSecOC_Fresh_Byte0"]) & 0x3
     self.oem_1d0_secoc_wire_ctr = cur_wire
     # Rebuild the full msg_counter that the EPS validates the MAC against. Only 6 bits
-    # are on the wire; the high bits are a PER-GW-RESET-WINDOW count — they reset to 0
-    # each time the GW `reset` counter increments (~1 Hz). Determined empirically
-    # on-vehicle 2026-10-19: a per-window seed (small high bits) held engagement with a
-    # valid MAC for ~0.5 s, while a continuous-from-startup counter (large high bits)
-    # failed the MAC within ~3 frames. So: zero the wrap count on each GW reset, and
-    # bump it on each 6-bit wire wrap (63 -> 0) within the window. A wrap is any
-    # decrease, caught as long as we never skip a full 64-frame span (we run at the
-    # OEM's 100 Hz).
-    if self.secoc_reset != self._oem_secoc_reset_tracked:
-      self._oem_secoc_reset_tracked = self.secoc_reset
+    # are on the wire; the high bits are a PER-WINDOW wrap count that restarts to 0 each
+    # time OEM's 0x1D0 counter restarts. Determined empirically on-vehicle 2026-10-19: a
+    # per-window seed (small high bits) held engagement with a valid MAC for ~0.5 s, while
+    # a continuous-from-startup counter (large high bits) failed the MAC within ~3 frames.
+    #
+    # Anchor the window to OEM's OWN reset-flag in byte 4 (rflag = fresh & 3), NOT the GW
+    # sync (0x20) `reset` counter: OEM's 0x1D0 restart LAGS the 0x20 reset by ~10 ms, so
+    # zeroing on the 0x20 edge counted OEM's own post-reset restart (wire 63 -> 0) as a
+    # wrap -> full counter stuck +64 too high for the whole window -> carcontroller seed
+    # +64 -> EPS rejects the jump and aborts lateral (EPS_AbortFb=8, observed intermittent
+    # on-vehicle 2026-10-27). The 0x1D0's own rflag flips exactly when its counter restarts,
+    # so keying the window off it zeroes wraps in lockstep with OEM — no phantom wrap. A
+    # mid-window wrap is still any wire decrease (we run at OEM's 100 Hz, never skipping a
+    # full 64-frame span).
+    if cur_rflag != self._oem_secoc_rflag_last:
+      self._oem_secoc_rflag_last = cur_rflag
       self._oem_secoc_wraps = 0
     elif cur_wire < self._oem_secoc_wire_last:
       self._oem_secoc_wraps += 1
