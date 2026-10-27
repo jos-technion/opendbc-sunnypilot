@@ -271,9 +271,16 @@ class CarController(CarControllerBase):
     if lat_engaged:
       desired_angle_deg = self._remote_steer_override(desired_angle_deg,
                                                        CS.out.vEgoRaw, now_nanos)
+    # Engage ramp: while the engage delay is running we are NOT transmitting, so the wheel
+    # cannot follow. If the limiter slews toward the planner angle during that time, the first
+    # frame we send is several degrees from the wheel, Panda's per-frame rate check rejects it
+    # (and every one after it, since the wheel never moves), the EPS gets no 0x1D0 and aborts
+    # (seen: first cmd -3.44 deg vs wheel +0.12, 15 frames rejected, abort=8 at +110 ms).
+    # Hold the limiter at the measured wheel angle until the first TX tick.
+    engage_hold = lat_engaged and (not self.was_lat_engaged_prev or self.engage_delay_remaining > 0)
     self.apply_angle_last = apply_std_steer_angle_limits(
       desired_angle_deg, self.apply_angle_last, CS.out.vEgoRaw,
-      CS.out.steeringAngleDeg, lat_active, self.params.ANGLE_LIMITS,
+      CS.out.steeringAngleDeg, lat_active and not engage_hold, self.params.ANGLE_LIMITS,
     )
 
     # "We ARE OEM" counter continuation. All three counters (alive_1d0, alive_1c0,
