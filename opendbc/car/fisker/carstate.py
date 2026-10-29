@@ -424,7 +424,14 @@ class CarState(CarStateBase):
     # ADAS_Sts_ACC_ICC 9/10 = Failure_reversible/irreversible (same enum position as
     # the old VCU_Sts_CC_ICC path — the fault codes carry the same meaning across
     # both authors).
-    ret.accFaulted = cc_state in (9, 10) or bool(cp_pt.vl["ESP_0x114"]["ESP_FltIndcn_AEB"])
+    #
+    # accFaulted raises EventName.accFaulted ("Cruise Fault: Restart the Car to Engage"),
+    # which is NO_ENTRY + IMMEDIATE_DISABLE and blocks ALL engagement — including MADS
+    # lateral — until the car is restarted. By request (2026-10-29) we DISABLE it so we
+    # can still engage lateral (MADS) with a standing OEM cruise/AEB fault. The raw fault
+    # bits are kept here (unused) for diagnostics / easy re-enable.
+    _acc_faulted_raw = cc_state in (9, 10) or bool(cp_pt.vl["ESP_0x114"]["ESP_FltIndcn_AEB"])  # noqa: F841
+    ret.accFaulted = False
 
     # ---- OEM ADAS lateral counters (bus 2, for takeover alignment) --------
     # Snapshot the OEM ADAS's own AliveCounter and SSecOC_Fresh_Byte0 from bus 2. The
